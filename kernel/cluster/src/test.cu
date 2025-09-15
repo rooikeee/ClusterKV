@@ -17,8 +17,8 @@ KMeansSearchIndicesKernel(int64_t* __restrict__ num_need_clusters,
 	int head_idx = blockIdx.x;
 	int num_kv_group = num_heads / num_kv_heads;
 	int kv_head_idx = head_idx / num_kv_group;
-	int cluster_idx = threadIdx.x;
-	if (cluster_idx < num_need_clusters[head_idx]) {
+	for (int cluster_idx = threadIdx.x; cluster_idx < num_need_clusters[head_idx]; cluster_idx += blockDim.x) 
+	{
 		// Inversed order to use the prefix sum of torch.cumsum
 		int64_t ind_start = sel_cluster_key_start[head_idx*max_num_need_clusters + cluster_idx];
 		int64_t ind_end = sel_cluster_key_end[head_idx*max_num_need_clusters + cluster_idx];
@@ -44,7 +44,7 @@ cudaError_t KMeansSearchIndices(int64_t* num_need_clusters,
 								cudaStream_t stream = nullptr) {
 
 	dim3 nblks(num_heads);
-	dim3 nthrs(max_num_need_clusters);
+	dim3 nthrs(1024);
 	auto kernel = KMeansSearchIndicesKernel;
 	void* args[] = {(void*)&num_need_clusters,
 					(void*)&sel_cluster_size_ps,
