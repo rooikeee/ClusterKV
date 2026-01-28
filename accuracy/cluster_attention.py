@@ -1,3 +1,4 @@
+from re import L
 from typing import Optional, Tuple, List
 import math
 
@@ -22,6 +23,7 @@ import rmm
 
 from clusterkv._clusterkv_knl import search_indices
 from .cluster_cache_simulator import CacheSimulator
+import os 
 
 # Use this function as the metadata only has 2-dim
 def repeat_metadata(metadata: torch.Tensor, n_rep: int) -> torch.Tensor:
@@ -100,12 +102,15 @@ def stat_topk(layer_id, indices, q, prefill_keys, name):
 def cluster_attn_out(query_states, key_states, value_states, attention_mask, prompt_len,
                     key_centroids, cluster_key_indices, cluster_key_size, cluster_key_size_ps,
                     num_key_value_groups, layer_id, token_budget, sink, head_sel, 
-                    cluster_cache, topk_stat=False, cluster_params=None):
+                    cluster_cache, topk_stat=False, cluster_params=None, query_states_pre_rope=None, total_sel_cluster=None):
     bsz, num_kv_heads, kv_seq_len, head_dim = key_states.shape
+    if os.getenv("PRE_ROPE"):
+        c_dist = torch.matmul(query_states_pre_rope, key_centroids.transpose(2, 3))
+    else:
+        c_dist = torch.matmul(query_states, key_centroids.transpose(2, 3))
     _, num_heads, q_len, _ = query_states.shape
     hidden_size = num_heads * head_dim
 	# c_dist: (1, num_heads, 1, nlist)
-    c_dist = torch.matmul(query_states, key_centroids.transpose(2, 3))
     _, c_neighbor = torch.sort(c_dist, dim=-1, descending=True)
     # (num_heads, nlist)
     c_neighbor = c_neighbor.squeeze(0).squeeze(-2)
@@ -121,6 +126,9 @@ def cluster_attn_out(query_states, key_states, value_states, attention_mask, pro
 
 	# (num_heads, max_num_need_clusters)
     sel_cluster_indices = c_neighbor[:, :max_num_need_clusters]
+    if os.getenv("GET_CLUSTERS"):
+        assert total_sel_cluster is not None
+        total_sel_cluster.append(sel_cluster_indices)
     sel_cluster_size = neighbor_cluster_size[:, :max_num_need_clusters]
     # not use neighbor_cluster_key_size_ps[, :max_num_need_clusters] as it has be modified
     sel_cluster_size_ps = torch.cumsum(sel_cluster_size, dim=-1)
@@ -130,15 +138,21 @@ def cluster_attn_out(query_states, key_states, value_states, attention_mask, pro
     if cluster_cache is not None:
         cluster_params.update(sel_cluster_indices)
     
-    # if self.layer_id == 10:
-    #     print(neighbor_cluster_size[1])
-    #     print(neighbor_cluster_key_size_ps[1])
-    #     print(num_need_clusters[1])
-    #     print(max_num_need_clusters)
-    #     print(sel_cluster_indices[1])
-    #     print(sel_cluster_size[1])
-    #     print(sel_cluster_key_end[1])
-    #     print(sel_cluster_key_start[1])
+    # if layer_id == 10:
+        # print("neighbor_cluster_size[0]: ",neighbor_cluster_size[1], neighbor_cluster_size.shape)
+        # print("neighbor_cluster_key_size_ps[1]: ", neighbor_cluster_key_size_ps[1], neighbor_cluster_key_size_ps.shape)
+        # print("num_need_clusters[1]: ", num_need_clusters)
+        # print("max_num_need_clusters: ", max_num_need_clusters)
+        # print("sel_cluster_indices[1]: ", sel_cluster_indices[1])
+        # print("sel_cluster_size[1]: ", sel_cluster_size[1])
+        # print("sel_cluster_key_end[1]: ", sel_cluster_key_end[1])
+        # print("sel_cluster_key_start[1]: ", sel_cluster_key_start[1])
+        # print(num_need_clusters[1])
+        # print(max_num_need_clusters)
+        # print(sel_cluster_indices[1])
+        # print(sel_cluster_size[1])
+        # print(sel_cluster_key_end[1])
+        # print(sel_cluster_key_start[1])
     #     print()
     use_search_kernel = True
 
@@ -209,8 +223,6 @@ def cluster_attn_out(query_states, key_states, value_states, attention_mask, pro
     sel_value_states = torch.cat([value_states[:, :, :sink, :], sel_value_states, 
                                   value_states[:, :, prompt_len:, :]], dim=2)
 
-    # if self.layer_id == 10:
-    #     print(sel_key_states.shape, sel_value_states.shape)
     attn_weights = torch.matmul(query_states, sel_key_states.transpose(2, 3)) / math.sqrt(head_dim)
 
     if attention_mask is not None:  # no matter the length, we just slice it
@@ -252,6 +264,28 @@ def forward_cluster(
             # reset cache for each request
             if self.cache_steps > 0 and self.layer_id >= 2:
                 self.cluster_cache = CacheSimulator(self.layer_id, self.cache_steps+1)
+            if os.getenv("PRE_ROPE") and self.layer_id >= 2:
+                assert self.key_centroids is None
+                key_states = (
+                    self.k_proj(hidden_states)
+                    .view(bsz, q_len, self.num_key_value_heads, self.head_dim)
+                    .transpose(1, 2)
+                )
+                prefill_key = key_states[..., self.sink:, :]
+                if self.nlist == 0:
+                    self.nlist = prefill_key.shape[-2] // 80
+                self.cluster_params = KMeansParams(
+                    n_clusters=self.nlist, 
+                    max_iter=self.cluster_params.max_iter, 
+                    metric="cosine")
+                assert key_states.shape[-2] > self.sink 
+                self.key_centroids, self.cluster_key_indices, \
+                self.cluster_key_ptr, self.cluster_key_size, self.cluster_key_size_ps = \
+                build_cluster(prefill_key, self.nlist, self.balance, 
+                    self.cluster_params, self.num_key_value_groups, self.gqa_policy)
+                if os.getenv("GET_CLUSTERS"):
+                    self.cluster_key = prefill_key
+
         return self.flash_forward(
             hidden_states,
             attention_mask,
@@ -268,10 +302,18 @@ def forward_cluster(
     prefill_key = prefill_key[..., sink:, :]
     # clustering for prefilled keys
     if self.key_centroids is None:
+        if self.nlist == 0:
+            self.nlist = prefill_key.shape[-2] // 80
+            self.cluster_params = KMeansParams(
+                n_clusters=self.nlist, 
+                max_iter=self.cluster_params.max_iter, 
+                metric="cosine")
         self.key_centroids, self.cluster_key_indices, \
         self.cluster_key_ptr, self.cluster_key_size, self.cluster_key_size_ps = \
 		build_cluster(prefill_key, self.nlist, self.balance, self.cluster_params,
                     self.num_key_value_groups, self.gqa_policy)
+        if self.cluster_key is None:
+            self.cluster_key = prefill_key
 
     query_states = (
         self.q_proj(hidden_states)
@@ -293,6 +335,7 @@ def forward_cluster(
     if past_key_value is not None:
         kv_seq_len += past_key_value[self.layer_id][0].shape[-2]
     cos, sin = self.rotary_emb(value_states, position_ids)
+    query_states_pre_rope = query_states
     query_states, key_states = apply_rotary_pos_emb(
         query_states, key_states, cos, sin, position_ids
     )
@@ -311,7 +354,7 @@ def forward_cluster(
         self.prompt_len, self.key_centroids, self.cluster_key_indices, 
         self.cluster_key_size, self.cluster_key_size_ps,
         self.num_key_value_groups, self.layer_id, token_budget, 
-        sink, self.head_sel, self.cluster_cache, self.topk_stat, self.cluster_params
+        sink, self.head_sel, self.cluster_cache, self.topk_stat, self.cluster_params, query_states_pre_rope, self.total_sel_cluster
     )
     attn_output = self.o_proj(attn_output)
 
@@ -511,6 +554,9 @@ def cluster_reset(model):
         module.cluster_key_ptr = None
         module.cluster_key_size = None
         module.cluster_key_size_ps = None
+        module.cluster_key = None
+        if os.getenv("GET_CLUSTERS"):
+            module.total_sel_cluster = []
 
 def apply_cluster_config(module, args):
     nlist = args.nlist
