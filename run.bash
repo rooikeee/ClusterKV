@@ -1,0 +1,1 @@
+CUDA_VISIBLE_DEVICES=3 python accuracy/LongBench/pred.py --model llama3.1-8b-chat-8k --token_budget 2048 --sink 128 --echo --re

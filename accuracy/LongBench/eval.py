@@ -36,7 +36,8 @@ dataset2metric = {
     "passage_count": count_score,
     "passage_retrieval_zh": retrieval_zh_score,
     "lcc": code_sim_score,
-    "repobench-p": code_sim_score,
+    "repobench": code_sim_score,
+    "repobench_p": code_sim_score,
 }
 
 def parse_args(args=None):
@@ -88,15 +89,20 @@ if __name__ == '__main__':
         out_path = f"{path}/result-n2eos.json"
     else:
         out_path = f"{path}/result.json"
-    if os.path.exists(out_path):
-        if args.task is not None or args.method is not None:
-            # Update incrementally
-            with open(out_path) as f:
-                scores = json.load(f)
+        if args.task:
+            out_path = f"{path}/result-{args.task}.json"
+    # if os.path.exists(out_path):
+    #     if args.task is not None or args.method is not None:
+    #         # Update incrementally
+    #         with open(out_path) as f:
+    #             scores = json.load(f)
 
+    task = args.task
     all_files = sorted(os.listdir(path))
     print("Evaluating on:", all_files)
     for filename in all_files:
+        if task and task not in filename:
+            continue
         if not filename.endswith("jsonl"):
             continue
         predictions, answers, lengths = [], [], []
@@ -128,6 +134,6 @@ if __name__ == '__main__':
             score = scorer(dataset, predictions, answers, all_classes)
         if dataset not in scores:
             scores[dataset] = {}
-        scores[dataset][method] = score
+        scores[dataset][f"{method}"] = score
     with open(out_path, "w") as f:
         json.dump(scores, f, ensure_ascii=False, indent=4)

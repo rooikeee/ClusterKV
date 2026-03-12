@@ -1,0 +1,10 @@
+总结了下，我们下面应该会往这几个方面看
+-对于已经测试过的模型（llama/qwen2.5 like）
+    -分析聚类结构（不同head/layer/任务，包括类在token上的分布&在k空间的分布）
+    -分析RoPE的影响（pre&post RoPE的key分布）
+    -基于分析尝试做出改进，比如
+        -for accuracy: density-based clustering, adaptive number of centriods, 
+        -for efficiency: 部分头退化成block-wise/streaming, dimension pruning, static anchors
+-对于新模型
+    -Qwen3：QKNorm会对key分布和clustering带来什么影响
+    -MLA：在c上直接聚类会有什么问题（1. 维度更高，精度/开销都可能更差 2. head间一致性问题），怎么解决

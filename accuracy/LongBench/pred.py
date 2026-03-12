@@ -13,9 +13,10 @@ from tqdm import tqdm
 import numpy as np
 import random
 import argparse
-from accuracy.patch import parse_common_args, enable_attention_eval, get_config_output_affix
+from accuracy.patch import parse_common_args, enable_attention_eval, get_config_output_affix, build_chat
 from accuracy.cluster_attention import cluster_reset
-
+from accuracy.echokv_attention import echo_reset
+import pickle
 
 def parse_args(args=None):
     parser = argparse.ArgumentParser()
@@ -24,16 +25,9 @@ def parse_args(args=None):
     parser.add_argument("--task", type=str, help="task name", default=None)
     parser.add_argument("--debug", action="store_true")
     parser.add_argument("--data_idx", type=int, default=None)
+    parser.add_argument("--mode", type=str, default=None)
+    parser.add_argument("--re", action="store_true")
     return parser.parse_args(args)
-
-
-# This is the customized building prompt for chat models
-def build_chat(tokenizer, prompt, model_name):
-    if "glm4" in model_name or "intern" in model_name or "llama3" in model_name:
-        prompt = tokenizer.apply_chat_template([{"role": "user", "content": prompt}],
-                                                add_generation_prompt=True, tokenize=False)
-    return prompt
-
 
 def get_pred(
     model,
@@ -46,17 +40,23 @@ def get_pred(
     model_name,
 ):
     preds = []
-    for _, json_obj in enumerate(tqdm(data)):
+    pbar = tqdm(data)
+    if os.getenv("GET_TOPK"):
+        max_gen = 256
+        
+    for idx, json_obj in enumerate(pbar):
+        pbar.set_description(
+            f"Generating for dataset {dataset}, q_idx {idx+1}"
+        )
+        
         if args.cluster:
             cluster_reset(model)
+        
+        if args.echo:
+            echo_reset(model)
+
         prompt = prompt_format.format(**json_obj)
-        tokenized_prompt = tokenizer(
-            prompt, truncation=False, return_tensors="pt"
-        ).input_ids[0]
-        if "glm4" in model_name:
-            tokenized_prompt = tokenizer(
-                prompt, truncation=False, return_tensors="pt", add_special_tokens=False
-            ).input_ids[0]
+        tokenized_prompt = tokenizer.encode(prompt)
 
         # truncate to fit max_length (we suggest truncate in the middle, since the left and right side may contain crucial instructions)
         if len(tokenized_prompt) > max_length:
@@ -64,120 +64,45 @@ def get_pred(
             prompt = tokenizer.decode(
                 tokenized_prompt[:half], skip_special_tokens=True
             ) + tokenizer.decode(tokenized_prompt[-half:], skip_special_tokens=True)
+            
         if dataset not in [
             "trec",
+            "triviaqa",
             "samsum",
             "lsht",
             "lcc",
-            "repobench-p",
+            "repobench_p",
         ]:  # chat models are better off without build prompts on these tasks
             prompt = build_chat(tokenizer, prompt, model_name)
-        # print(prompt)
-        # split the prompt and question (simulate decoding in the question stage)
-        if dataset in ["qasper", "hotpotqa", "2wikimqa", "musique"]:
-            q_pos = prompt.rfind("Question:")
-        elif dataset in ["multifieldqa_en", "gov_report", "qmsum"]:
-            q_pos = prompt.rfind("Now,")
-        elif dataset in ["triviaqa"]:
-            q_pos = prompt.rfind("Answer the question")
-        elif dataset in ["narrativeqa"]:
-            q_pos = prompt.rfind("Do not provide")
-        elif dataset in ["passage_retrieval_en"]:
-            q_pos = prompt.rfind("The following is an abstract.")
+    
+        if isinstance(prompt, str):
+            input = tokenizer(prompt, truncation=False, return_tensors="pt").to(
+                model.device
+            ).input_ids
         else:
-            assert False
+            input = prompt
+            
+        context_length = input.shape[-1]
+        output = model.generate(
+            input,
+            max_new_tokens=max_gen,
+            num_beams=1,
+            do_sample=False,
+            pad_token_id=tokenizer.eos_token_id,
+        )[0]
 
-        # max simulation length is 100
-        max_sim_len = 100
-        q_pos = max(len(prompt) - max_sim_len, q_pos)
+        pred = tokenizer.decode(output[context_length:], skip_special_tokens=True)
 
-        if q_pos != None:
-            question = prompt[q_pos:]
-            prompt = prompt[:q_pos]
-
-        input = tokenizer(prompt, truncation=False, return_tensors="pt").to("cuda")
-        q_input = tokenizer(question, truncation=False, return_tensors="pt").to("cuda")
-        q_input.input_ids = q_input.input_ids[:, 1:]
-
-        # print(input.input_ids.shape[-1], q_input.input_ids.shape[-1])
-        # context_length = input.input_ids.shape[-1] + q_input.input_ids.shape[-1]
-
-        if (
-            dataset == "samsum"
-        ):  # prevent illegal output on samsum (model endlessly repeat "\nDialogue"), might be a prompting issue
-            assert False
-        else:
-            with torch.no_grad():
-                if "glm4" in model_name:
-                    model_kwargs = {
-                        "past_key_values": None,
-                        "return_last_logit": True,
-                        "use_cache": True,
-                        "is_first_forward": True,
-                    }
-                    input_ids = input.input_ids
-                    model_inputs = model.prepare_inputs_for_generation(input_ids, **model_kwargs)
-                    output = model(
-                        **model_inputs, return_dict=True, 
-                        output_attentions=False, output_hidden_states=False,
-                    )
-                    for q_input_id in q_input.input_ids[0]:
-                        input_ids = torch.cat([input_ids, q_input_id.unsqueeze(0).unsqueeze(0)], dim=-1)
-                        model_kwargs = model._update_model_kwargs_for_generation(output, model_kwargs)
-                        model_inputs = model.prepare_inputs_for_generation(input_ids, **model_kwargs)
-                        output = model(
-                            **model_inputs, return_dict=True, 
-                            output_attentions=False, output_hidden_states=False,
-                        )
-                    pred_token_idx = output.logits[:, -1, :].argmax(dim=-1).unsqueeze(1)
-                    generated_content = [pred_token_idx.item()]
-                    input_ids = torch.cat([input_ids, pred_token_idx], dim=-1)
-                    for _ in range(max_gen - 1):
-                        model_kwargs = model._update_model_kwargs_for_generation(output, model_kwargs)
-                        model_inputs = model.prepare_inputs_for_generation(input_ids, **model_kwargs)
-                        output = model(
-                            **model_inputs, return_dict=True, 
-                            output_attentions=False, output_hidden_states=False,
-                        )
-                        pred_token_idx = output.logits[:, -1, :].argmax(dim=-1).unsqueeze(-1)
-                        generated_content += [pred_token_idx.item()]
-                        input_ids = torch.cat([input_ids, pred_token_idx], dim=-1)
-                        if pred_token_idx.item() in [151329, 151336, 151338]:
-                            break
-                else:
-                    output = model(
-                        input_ids=input.input_ids,
-                        past_key_values=DynamicCache.from_legacy_cache(),
-                    )
-                    past_key_values = output.past_key_values
-                    for input_id in q_input.input_ids[0]:
-                        output = model(
-                            input_ids=input_id.unsqueeze(0).unsqueeze(0),
-                            past_key_values=past_key_values,
-                        )
-                        past_key_values = output.past_key_values
-
-                    pred_token_idx = output.logits[:, -1, :].argmax(dim=-1).unsqueeze(1)
-                    generated_content = [pred_token_idx.item()]
-                    for _ in range(max_gen - 1):
-                        outputs = model(
-                            input_ids=pred_token_idx,
-                            past_key_values=past_key_values,
-                        )
-
-                        past_key_values = outputs.past_key_values
-                        pred_token_idx = (
-                            outputs.logits[:, -1, :].argmax(dim=-1).unsqueeze(1)
-                        )
-                        generated_content += [pred_token_idx.item()]
-                        if "glm4" in model_name:    # glm4 has 3 stop tokens
-                            if pred_token_idx.item() in [151329, 151336, 151338]:
-                                break
-                        if pred_token_idx.item() == tokenizer.eos_token_id:
-                            break
-
-        pred = tokenizer.decode(generated_content, skip_special_tokens=True)
+        if len(data) == 1:
+            print(pred)
+            print(len(output[context_length:]))
         # pred = tokenizer.decode(output[context_length:], skip_special_tokens=True)
+        if args.echo:
+            for idx, layer in enumerate(model.model.layers):
+                corr_count = layer.self_attn.corr_count
+                if corr_count > 0:
+                    print(f"layer {idx}, corr_count {corr_count}, gen_len: {len(output[context_length:])}")
+          
         preds.append(
             {
                 "pred": pred,
@@ -186,8 +111,62 @@ def get_pred(
                 "length": json_obj["length"],
             }
         )
+
+        if os.getenv("GET_CLUSTERS"):
+            get_clusters(model)
+        
+        if os.getenv("GET_ATTN"):
+            get_attention(model)
+        
+        if os.getenv("GET_TOPK"):
+            get_topk(model)
+
     return preds
 
+def get_clusters(model: LlamaForCausalLM):
+    cluster_key_indices, cluster_key_ptr, \
+        layer_key_states, key_centroids, sel_clusters = [], [], [], [], []
+    for layer in model.model.layers:
+        if hasattr(layer.self_attn, "cluster_key_indices"):
+            cluster_key_indices.append(layer.self_attn.cluster_key_indices)
+            cluster_key_ptr.append(layer.self_attn.cluster_key_ptr)
+            layer_key_states.append(layer.self_attn.cluster_key)
+            key_centroids.append(layer.self_attn.key_centroids)
+            sel_clusters.append(layer.self_attn.total_sel_cluster)
+    suffix = "pre_rope" if os.getenv("PRE_ROPE") else "post_rope"
+    save_dir = os.path.join("/state", "partition", "cwli", f"{model_name}-{suffix}", args.task)
+    print(save_dir)
+    os.makedirs(save_dir, exist_ok=True)
+    with open(os.path.join(save_dir, "cluster_key_indices.pkl"), 'wb') as f:
+        pickle.dump({'cluster_key_indices': cluster_key_indices, 
+                    'cluster_key_ptr': cluster_key_ptr,
+                    'key_states': layer_key_states,
+                    'key_centroids': key_centroids,
+                    'sel_clusters': sel_clusters}, f)
+
+def get_attention(model: LlamaForCausalLM):
+    if os.getenv("PRE_ROPE"):
+        suffix = "pre_rope"
+    elif os.getenv("NORMAL_ATTN"):
+        suffix = ""
+    else:
+        suffix = "post_rope"
+    save_dir = os.path.join("/state", "partition", "cwli", f"{model_name}-{suffix}", "attn_weight")
+    os.makedirs(save_dir, exist_ok=True)
+    print(save_dir)
+    for layer_idx, layer in enumerate(model.model.layers):
+        if hasattr(layer.self_attn, "attn_weight"):
+            attn_weigths = layer.self_attn.attn_weight
+            torch.save(attn_weigths, os.path.join(save_dir, f"layer-{layer_idx}.pt"))
+
+def get_topk(model: LlamaForCausalLM):
+    save_dir = os.path.join("/state", "partition", "cwli", f"{model_name}", "topk")
+    os.makedirs(save_dir, exist_ok=True)
+    print(save_dir)
+    for layer_idx, layer in enumerate(model.model.layers):
+        if hasattr(layer.self_attn, "attn_weight"):
+            attn_weigths = layer.self_attn.attn_weight
+            torch.save(attn_weigths, os.path.join(save_dir, f"layer-{layer_idx}.pt"))
 
 def seed_everything(seed):
     torch.manual_seed(seed)
@@ -203,21 +182,21 @@ def load_model_and_tokenizer(path, model_name, device):
     if "intern" in model_name or "qwen" in model_name or "glm4" in model_name:
         tokenizer = AutoTokenizer.from_pretrained(path, trust_remote_code=True)
         model = AutoModelForCausalLM.from_pretrained(
-            path, trust_remote_code=True, torch_dtype=torch.float16,
+            path, trust_remote_code=True, torch_dtype=torch.bfloat16,
             device_map="auto", low_cpu_mem_usage=True,
             attn_implementation="flash_attention_2", use_cache=True
-        ).to(device)
+        )
     elif "llama" in model_name:
         tokenizer = AutoTokenizer.from_pretrained(path)
         model = LlamaForCausalLM.from_pretrained(
-            path, torch_dtype=torch.float16, device_map="auto", low_cpu_mem_usage=True,
+            path, torch_dtype=torch.bfloat16, device_map="auto", low_cpu_mem_usage=True,
             attn_implementation="flash_attention_2", use_cache=True
         )
     else:
         assert False
     model = model.eval()
 
-    if args.quest or args.cluster:
+    if args.quest or args.cluster or args.echo:
         enable_attention_eval(model_name, model, args)
 
     return model, tokenizer
@@ -234,15 +213,27 @@ def load_model_with_retry(model_path, model_name, device, retries=3, delay=1):
             else:
                 raise  # Re-raise the last exception if all retries fail
 
+def load_data(data_dir, method, task, qid=None):
+    data_path = os.path.join(os.getcwd(), data_dir)
+    data = []
+    file_name = f"{task}.jsonl"
+    with open(os.path.join(data_path, file_name), 'r', encoding='utf-8') as f:
+        for line in f:
+            example = json.loads(line)
+            data.append(example)
+    if qid is not None:
+        data = data[qid:qid+1]
+    return data
+
 if __name__ == "__main__":
     seed_everything(42)
     args = parse_args()
     assert not (args.quest and args.cluster)     # cannot be enabled at same time
     if args.dist_t != "cosine":
         assert args.debug
-    
-    model2path = json.load(open("../config/model2path.json", "r"))
-    model2maxlen = json.load(open("../config/model2maxlen.json", "r"))
+    mode = args.mode
+    model2path = json.load(open("accuracy/config/model2path.json", "r"))
+    model2maxlen = json.load(open("accuracy/config/model2maxlen.json", "r"))
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model_name = args.model
     # define your model
@@ -252,6 +243,15 @@ if __name__ == "__main__":
     max_length = model2maxlen[model_name]
     if args.task is not None:
         datasets = [args.task]
+    elif args.re:
+        datasets = [
+            "gov_report",
+            "musique",
+            "dureader",
+            "lcc",
+            "2wikimqa",
+            "samsum"
+        ]
     else:
         datasets = [
             "qasper",
@@ -266,11 +266,19 @@ if __name__ == "__main__":
             "passage_count",
             "passage_retrieval_en",
             "lcc",
-            "repobench-p",
+            "repobench_p",
+            "narrativeqa",
+            "multifieldqa_zh",
+            "dureader",
+            "vcsum",
+            "passage_retrieval_zh",
+            "lsht",
+            "musique",
+            "qmsum",
         ]
     # we design specific prompt format and max generation length for each task, feel free to modify them to optimize model output
-    dataset2prompt = json.load(open("config/dataset2prompt.json", "r"))
-    dataset2maxlen = json.load(open("config/dataset2maxlen.json", "r"))
+    dataset2prompt = json.load(open("accuracy/config/dataset2prompt.json", "r"))
+    dataset2maxlen = json.load(open("accuracy/config/dataset2maxlen.json", "r"))
     # predict on each dataset
     if not os.path.exists("pred"):
         os.makedirs("pred")
@@ -278,9 +286,10 @@ if __name__ == "__main__":
         os.makedirs("pred_e")
     if not os.path.exists("debug"):
         os.makedirs("debug")
+    data_dir = os.path.join("accuracy/LongBench/datasets")
     for dataset in datasets:
         if args.e:
-            data = load_dataset("THUDM/LongBench", f"{dataset}_e", split="test")
+            data = load_data(data_dir, "longbench", dataset, args.data_idx)
             res_dir = "debug" if args.debug or args.data_idx is not None else "pred_e"
             if not os.path.exists(f"{res_dir}/{model_name}"):
                 os.makedirs(f"{res_dir}/{model_name}")
@@ -290,18 +299,19 @@ if __name__ == "__main__":
             else:
                 out_path = f"{res_dir}/{model_name}/{dataset}.jsonl"
         else:
-            data = load_dataset("THUDM/LongBench", f"{dataset}", split="test")
+            data = load_data(data_dir, "longbench", dataset, args.data_idx)
             res_dir = "debug" if args.debug or args.data_idx is not None else "pred"
             if not os.path.exists(f"{res_dir}/{model_name}"):
                 os.makedirs(f"{res_dir}/{model_name}")
             config_affix = get_config_output_affix(args)
-            out_path = f"{res_dir}/{model_name}/{dataset}{config_affix}.jsonl"
+            if mode:
+                out_path = f"{res_dir}/{model_name}/{dataset}{config_affix}_{mode}.jsonl"
+            else:
+                out_path = f"{res_dir}/{model_name}/{dataset}{config_affix}.jsonl"
+        print(f"result save in {out_path}")
         prompt_format = dataset2prompt[dataset]
         max_gen = dataset2maxlen[dataset]
-        if args.debug:
-            data = data.select(range(1))
-        elif args.data_idx is not None:
-            data = data.select(range(args.data_idx, args.data_idx+1))
+        
         preds = get_pred(
             model,
             tokenizer,

@@ -2,9 +2,12 @@
     "llama3-8b-chat-4k": "meta-llama/Meta-Llama-3-8B-Instruct",
     "llama3-8b-chat-8k": "meta-llama/Meta-Llama-3-8B-Instruct",
     "llama3.1-8b-chat-4k": "meta-llama/Meta-Llama-3.1-8B-Instruct",
-    "llama3.1-8b-chat-8k": "meta-llama/Meta-Llama-3.1-8B-Instruct",
+    "llama3.1-8b-chat-8k": "/state/partition/gdliu/huggingface/hub/models--meta-llama--Meta-Llama-3.1-8B-Instruct/snapshots/0e9e39f249a16976918f6564b8830bc894c89659",
     "llama3.1-8b-chat-32k": "meta-llama/Llama-3.1-8B-Instruct",
     "glm4-9b-chat-4k": "/data/huggingface/hub/models--ZhipuAI--glm-4-9b-chat/",
     "glm4-9b-chat-8k": "/data/huggingface/hub/models--ZhipuAI--glm-4-9b-chat/",
-    "glm4-9b-chat-32k": "/data/huggingface/hub/models--ZhipuAI--glm-4-9b-chat/"
+    "glm4-9b-chat-32k": "/data/huggingface/hub/models--ZhipuAI--glm-4-9b-chat/",
+    "ds-r1-llama-8b": "/state/partition/gdliu/huggingface/hub/models--deepseek-ai--DeepSeek-R1-Distill-Llama-8B/snapshots/6a6f4aa4197940add57724a7707d069478df56b1",
+    "qwen-2.5-7b": "/state/partition/gdliu/huggingface/hub/models--Qwen--Qwen2.5-7B-Instruct/snapshots/a09a35458c702b33eeacc393d103063234e8bc28/",
+    "qwen-3-8b": "/state/partition/gdliu/huggingface/hub/models--Qwen--Qwen3-8B/snapshots/b968826d9c46dd6066d109eabc6255188de91218/"
 }

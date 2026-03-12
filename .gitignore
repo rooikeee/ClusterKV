@@ -16,3 +16,14 @@ debug/
 rmm_log.txt
 
 clusterkv/*.so
+accuracy/LongBench
+accuracy/o1/datatsets
+pictures
+pred
+figures
+accuracy/config
+analysis_pred.py 
+analysis_text.jsonl
+accuracy/LongBench2
+accuracy/o1/results
+pred_e

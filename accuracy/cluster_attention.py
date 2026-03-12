@@ -1,9 +1,10 @@
 from re import L
+from tkinter import NO
 from typing import Optional, Tuple, List
 import math
 
 import torch
-from torch import nn
+from torch import nn, tensor
 import torch.nn.functional as F
 from torch.nn.utils.rnn import pad_sequence
 
@@ -12,7 +13,7 @@ from transformers.models.llama.modeling_llama import (
     apply_rotary_pos_emb,
     repeat_kv,
 )
-from transformers.cache_utils import DynamicCache
+from transformers.cache_utils import DynamicCache, Cache
 
 from pylibraft.cluster import KMeansParams, fit
 from pylibraft.neighbors import ivf_flat
@@ -24,6 +25,7 @@ import rmm
 from clusterkv._clusterkv_knl import search_indices
 from .cluster_cache_simulator import CacheSimulator
 import os 
+from flash_attn import flash_attn_func 
 
 # Use this function as the metadata only has 2-dim
 def repeat_metadata(metadata: torch.Tensor, n_rep: int) -> torch.Tensor:
@@ -33,8 +35,8 @@ def repeat_metadata(metadata: torch.Tensor, n_rep: int) -> torch.Tensor:
     metadata = metadata[:, None, :].expand(num_key_value_heads, n_rep, slen)
     return metadata.reshape(num_key_value_heads * n_rep, slen)
 
-def build_cluster(prefill_key, nlist, balance, cluster_params, 
-                  num_key_value_groups, gqa_policy):
+def build_cluster(prefill_key, prefill_value, nlist, balance, cluster_params, 
+                  num_key_value_groups, gqa_policy, mode):
     _, num_kv_heads, prefill_len, head_dim = prefill_key.shape
     nlist_range = torch.arange(nlist, device=prefill_key.device).reshape(nlist, 1)
     cluster_key_indices = torch.empty((num_kv_heads, prefill_len), dtype=torch.int64,
@@ -43,18 +45,95 @@ def build_cluster(prefill_key, nlist, balance, cluster_params,
                                         device=prefill_key.device)
     cluster_key_size = torch.empty((num_kv_heads, nlist), dtype=torch.int32,
                                         device=prefill_key.device)
+    
+    pre_rope = os.getenv("PRE_ROPE")
+    if pre_rope:
+        all_head_max_indices = torch.empty((num_kv_heads, nlist), dtype=torch.int32,
+                                            device=prefill_key.device)
+    else:
+        all_head_max_indices = None
+    device = prefill_key.device
     for h in range(num_kv_heads):
         head_keys = prefill_key[0, h].to(torch.float32)
-        if balance:
-            flat_index = ivf_flat.build(cluster_params, head_keys)
-            head_centroids = flat_index.centers
+        seq_len = head_keys.shape[0]  # 获取当前序列长度
+        
+        if mode == "max_key_norm" or mode == "max_value_norm":
+            # 即使是 float16 输入，建议在 float32 下计算聚类以保证精度，最后转回
+            if mode == "max_key_norm":
+                magnitudes = torch.norm(head_keys.float(), p=2, dim=-1) # [m_len]
+            else:
+                head_values = prefill_value[0, h].to(torch.float32)
+                magnitudes = torch.norm(head_values.float(), p=2, dim=-1)
+            # --- 2. 均匀网格提取 Max Norm Leader ---
+            chunk_size = (prefill_len + nlist - 1) // nlist
+            pad_len = chunk_size * nlist - prefill_len
+            
+            # 用极小值 Pad，防止 Padding 区域被选为 Max
+            if pad_len > 0:
+                pad_mag = torch.full((pad_len,), -1e9, device=device)
+                padded_mag = torch.cat([magnitudes, pad_mag])
+            else:
+                padded_mag = magnitudes
+                
+            # [num_buckets, chunk_size]
+            reshaped_mag = padded_mag.view(nlist, chunk_size)
+            
+            # 找出每个网格内模长最大的局部索引
+            local_max_indices = torch.argmax(reshaped_mag, dim=-1)
+            
+            chunk_offsets = torch.arange(nlist, device=device) * chunk_size
+            leader_indices = chunk_offsets + local_max_indices
+            leader_indices = torch.clamp(leader_indices, max=prefill_len - 1) # 安全保护
+            
+            # 提取 Leader 特征
+            head_centroids = head_keys[leader_indices]       # 真实的质心
+            
+            for _ in range(cluster_params.max_iter):
+                # 步骤 A：计算每个 token 到当前质心的余弦相似度，并分配到最近的簇
+                sim = torch.mm(
+                    F.normalize(head_keys, p=2, dim=-1), 
+                    F.normalize(head_centroids, p=2, dim=-1).t()
+                )
+                _, labels = torch.max(sim, dim=-1)
+                
+                # 步骤 B：根据最新分配的标签，重新计算质心位置
+                new_centroids = torch.zeros_like(head_centroids)
+                # 使用 index_add_ 高效地将属于同一个 label 的 head_keys 累加起来
+                new_centroids.index_add_(0, labels, head_keys)
+                
+                # 统计每个簇的 token 数量，防止出现空簇导致的除以 0 错误
+                counts = torch.bincount(labels, minlength=nlist).unsqueeze(1).clamp(min=1)
+                # 更新质心 (求均值)
+                head_centroids = new_centroids / counts
         else:
-            head_centroids, _, _ = fit(cluster_params, head_keys)
+            if balance:
+                flat_index = ivf_flat.build(cluster_params, head_keys)
+                head_centroids = flat_index.centers
+            else:
+                head_centroids, _, _ = fit(cluster_params, head_keys)
         head_centroids = head_centroids.to(prefill_key.dtype)
         # centoid_indices: (prefill_len,)
         _, centoid_indices = torch.max(torch.mm(F.normalize(prefill_key[0, h], p=2, dim=-1), 
-                                                F.normalize(head_centroids, p=2, dim=-1).t()), 
+                                                F.normalize(head_centroids, p=2, dim=-1).t().to(prefill_key.device)), 
                                                 dim=-1)
+        
+        if pre_rope:
+            token_positions = torch.arange(seq_len, device=head_keys.device)
+            # 默认填 0。如果某个簇是空的，它会指向第 0 个 token (通常无害，因为 cluster_key_size 会是 0)
+            max_pos_indices = torch.empty(nlist, dtype=torch.long, device=head_keys.device)
+            
+            # 使用 scatter_reduce_ 选出每个簇中最大的 index
+            # index: centoid_indices (token 属于哪个簇)
+            # src: token_positions (token 的位置)
+            # reduce: 'max' (我们要选位置最靠后的)
+            max_pos_indices.scatter_reduce_(
+                0, 
+                centoid_indices, 
+                token_positions, 
+                reduce='max', 
+                include_self=False
+            )
+            all_head_max_indices[h] = max_pos_indices
         # if centoid_indices is like [3, 1, 1, 2]
         # cluster_key_ptr is [1, 1, 2, 3], cluster_key_indices is [1, 2, 3, 0]
         cluster_key_ptr[h], cluster_key_indices[h] \
@@ -83,6 +162,90 @@ def build_cluster(prefill_key, nlist, balance, cluster_params,
         cluster_key_size = repeat_metadata(cluster_key_size, num_key_value_groups)
         cluster_key_size_ps = repeat_metadata(cluster_key_size_ps, num_key_value_groups)
 
+    return key_centroids, cluster_key_indices, cluster_key_ptr, cluster_key_size, cluster_key_size_ps, all_head_max_indices
+
+def build_cluster_global_greedy(prefill_key, prefill_value, nlist, balance, cluster_params, 
+                  num_key_value_groups, gqa_policy, mode):
+    _, num_kv_heads, prefill_len, head_dim = prefill_key.shape
+    device = prefill_key.device
+    dtype = prefill_key.dtype
+    cluster_key_indices = torch.empty((num_kv_heads, prefill_len), dtype=torch.int64,
+                                            device=prefill_key.device)
+    cluster_key_ptr = torch.empty((num_kv_heads, prefill_len), dtype=torch.int16,
+                                        device=prefill_key.device)
+    cluster_key_size = torch.empty((num_kv_heads, nlist), dtype=torch.int32,
+                                        device=prefill_key.device)
+    nlist_range = torch.arange(nlist, device=prefill_key.device).reshape(nlist, 1)
+    # 遍历每个 Head
+    for h in range(num_kv_heads):
+        post_keys = prefill_key[0, h].to(torch.float32) # [seq_len, dim]
+        keys_norm = F.normalize(post_keys.float(), p=2, dim=-1)
+        if mode == "max_key_norm" or mode == "max_value_norm":
+            # 1. 获取当前 Head 的数据
+            if mode == "max_key_norm":
+                magnitudes = torch.norm(post_keys.float(), p=2, dim=-1) # [m_len]
+            else:
+                post_values = prefill_value[0, h].to(torch.float32)
+                magnitudes = torch.norm(post_values.float(), p=2, dim=-1) # [m_len]
+            # --- 2. 均匀网格提取 Max Norm Leader ---
+            chunk_size = (prefill_len + nlist - 1) // nlist
+            pad_len = chunk_size * nlist - prefill_len
+            
+            # 用极小值 Pad，防止 Padding 区域被选为 Max
+            if pad_len > 0:
+                pad_mag = torch.full((pad_len,), -1e9, device=device)
+                padded_mag = torch.cat([magnitudes, pad_mag])
+            else:
+                padded_mag = magnitudes
+                
+            # [num_buckets, chunk_size]
+            reshaped_mag = padded_mag.view(nlist, chunk_size)
+            # 找出每个网格内模长最大的局部索引
+            local_max_indices = torch.argmax(reshaped_mag, dim=-1)
+        else:
+            # find first token of chunk
+            local_max_indices = torch.zeros(
+                nlist, 
+                dtype=torch.long, 
+                device=reshaped_mag.device
+            )
+        
+        chunk_offsets = torch.arange(nlist, device=device) * chunk_size
+        leader_indices = chunk_offsets + local_max_indices
+        leader_indices = torch.clamp(leader_indices, max=prefill_len - 1) # 安全保护
+        # 提取 Leader 特征
+        leader_keys = post_keys[leader_indices].to(prefill_key.dtype)         # 真实的质心
+        leader_keys_norm = keys_norm[leader_indices]         # 用于算相似度
+        
+        # --- 3. 单步分配 (Voronoi Partitioning) ---
+        # 计算 Middle 区所有 Token 与 400 个 Leader 的相似度
+        # [m_len, dim] @ [dim, actual_num_buckets] -> [m_len, actual_num_buckets]
+        _, centroid_indices = torch.max(torch.mm(keys_norm, leader_keys_norm.t()), dim=-1)
+        
+        cluster_key_ptr[h], cluster_key_indices[h] \
+            = torch.where(centroid_indices==nlist_range)
+        cluster_key_size[h] = torch.bincount(cluster_key_ptr[h], minlength=nlist)
+        
+        leader_keys = leader_keys.unsqueeze(0)
+        if h == 0:
+            key_centroids = leader_keys
+        else:
+            key_centroids = torch.cat([key_centroids, leader_keys], dim=0)
+
+    cluster_key_size_ps = torch.cumsum(cluster_key_size, dim=-1)
+    # if self.layer_id == 10:
+    #     print(self.cluster_key_size_ps[1])
+    key_centroids = key_centroids.unsqueeze(0)
+        
+        # Optional: 打印一下当前 Head 生成了多少个簇
+        # print(f"Head {h}: Generated {len(head_centroids)} clusters from {prefill_len} tokens.")
+
+    if gqa_policy is None:
+        key_centroids = repeat_kv(key_centroids, num_key_value_groups)
+        cluster_key_ptr = repeat_metadata(cluster_key_ptr, num_key_value_groups)
+        cluster_key_size = repeat_metadata(cluster_key_size, num_key_value_groups)
+        cluster_key_size_ps = repeat_metadata(cluster_key_size_ps, num_key_value_groups)
+
     return key_centroids, cluster_key_indices, cluster_key_ptr, cluster_key_size, cluster_key_size_ps
 
 def stat_topk(layer_id, indices, q, prefill_keys, name):
@@ -102,18 +265,21 @@ def stat_topk(layer_id, indices, q, prefill_keys, name):
 def cluster_attn_out(query_states, key_states, value_states, attention_mask, prompt_len,
                     key_centroids, cluster_key_indices, cluster_key_size, cluster_key_size_ps,
                     num_key_value_groups, layer_id, token_budget, sink, head_sel, 
-                    cluster_cache, topk_stat=False, cluster_params=None, query_states_pre_rope=None, total_sel_cluster=None):
+                    cluster_cache, topk_stat=False, cluster_params=None, gqa_policy=None, total_sel_cluster=None):
     bsz, num_kv_heads, kv_seq_len, head_dim = key_states.shape
-    if os.getenv("PRE_ROPE"):
-        c_dist = torch.matmul(query_states_pre_rope, key_centroids.transpose(2, 3))
+    num_heads = query_states.shape[1]
+
+    if gqa_policy:
+        q_grouped = query_states.view(bsz, num_kv_heads, num_key_value_groups, 1, head_dim).mean(dim=2)[0]
+        c_dist = torch.matmul(q_grouped.to(key_centroids.device), key_centroids.transpose(2, 3))
     else:
-        c_dist = torch.matmul(query_states, key_centroids.transpose(2, 3))
+        c_dist = torch.matmul(query_states.to(key_centroids.device), key_centroids.transpose(2, 3))
     _, num_heads, q_len, _ = query_states.shape
     hidden_size = num_heads * head_dim
 	# c_dist: (1, num_heads, 1, nlist)
     _, c_neighbor = torch.sort(c_dist, dim=-1, descending=True)
     # (num_heads, nlist)
-    c_neighbor = c_neighbor.squeeze(0).squeeze(-2)
+    c_neighbor = c_neighbor.squeeze(0).squeeze(-2).to(cluster_key_size.device)
     neighbor_cluster_size = torch.gather(cluster_key_size, -1, c_neighbor)
     neighbor_cluster_key_size_ps = torch.cumsum(neighbor_cluster_size, dim=-1)
     # get the number of needed clusters by mask smaller and get min
@@ -138,28 +304,32 @@ def cluster_attn_out(query_states, key_states, value_states, attention_mask, pro
     if cluster_cache is not None:
         cluster_params.update(sel_cluster_indices)
     
-    # if layer_id == 10:
-        # print("neighbor_cluster_size[0]: ",neighbor_cluster_size[1], neighbor_cluster_size.shape)
-        # print("neighbor_cluster_key_size_ps[1]: ", neighbor_cluster_key_size_ps[1], neighbor_cluster_key_size_ps.shape)
-        # print("num_need_clusters[1]: ", num_need_clusters)
-        # print("max_num_need_clusters: ", max_num_need_clusters)
-        # print("sel_cluster_indices[1]: ", sel_cluster_indices[1])
-        # print("sel_cluster_size[1]: ", sel_cluster_size[1])
-        # print("sel_cluster_key_end[1]: ", sel_cluster_key_end[1])
-        # print("sel_cluster_key_start[1]: ", sel_cluster_key_start[1])
-        # print(num_need_clusters[1])
-        # print(max_num_need_clusters)
-        # print(sel_cluster_indices[1])
-        # print(sel_cluster_size[1])
-        # print(sel_cluster_key_end[1])
-        # print(sel_cluster_key_start[1])
+    # if layer_id == 2:
+    #     print("neighbor_cluster_size[0]: ",neighbor_cluster_size[1], neighbor_cluster_size.shape)
+    #     print("neighbor_cluster_key_size_ps[1]: ", neighbor_cluster_key_size_ps[1], neighbor_cluster_key_size_ps.shape)
+    #     print("num_need_clusters[1]: ", num_need_clusters)
+    #     print("max_num_need_clusters: ", max_num_need_clusters)
+    #     print("sel_cluster_indices[1]: ", sel_cluster_indices[1])
+    #     print("sel_cluster_size[1]: ", sel_cluster_size[1])
+    #     print("sel_cluster_key_end[1]: ", sel_cluster_key_end[1])
+    #     print("sel_cluster_key_start[1]: ", sel_cluster_key_start[1])
+    #     print(num_need_clusters[1])
+    #     print(max_num_need_clusters)
+    #     print(sel_cluster_indices[1])
+    #     print(sel_cluster_size_ps[1])
+    #     print(sel_cluster_key_end[1])
+    #     print(sel_cluster_key_start[1])
     #     print()
     use_search_kernel = True
 
     if use_search_kernel:
         max_num_indices = torch.sum(sel_cluster_size, dim=-1).max()
-        sel_key_indices = torch.full((num_heads, max_num_indices), kv_seq_len, 
-                                     dtype=torch.int64, device='cuda')
+        if gqa_policy:
+            sel_key_indices = torch.full((num_kv_heads, max_num_indices), kv_seq_len, 
+                                        dtype=torch.int64, device='cuda')
+        else:
+            sel_key_indices = torch.full((num_heads, max_num_indices), kv_seq_len, 
+                                        dtype=torch.int64, device='cuda')
         search_indices(num_need_clusters,
                     sel_cluster_size_ps,
                     sel_cluster_key_start,
@@ -192,7 +362,12 @@ def cluster_attn_out(query_states, key_states, value_states, attention_mask, pro
     sel_key_indices = sel_key_indices.unsqueeze(0)
     sel_key_indices += sink
     sel_key_indices[sel_key_indices > kv_seq_len] = kv_seq_len
-
+    
+    res_attn_weight = None
+    if os.getenv("GET_ATTN") and not os.getenv("NORMAL_ATTN"):
+        res_attn_weight = torch.zeros((1, num_heads, 1, prompt_len), dtype=torch.int32, device=sel_key_indices.device)
+        res_attn_weight = res_attn_weight.scatter_(dim=-1, index=sel_key_indices.unsqueeze(2), value=1.0)
+    
     if topk_stat:
         sink_indices = torch.arange(sink, device=sel_key_indices.device).repeat(1, num_heads, 1)
         full_sel_key_indices = torch.cat([sink_indices, sel_key_indices], dim=-1)
@@ -205,8 +380,9 @@ def cluster_attn_out(query_states, key_states, value_states, attention_mask, pro
     # sel_key_indices: (1, num_heads, token_budget, head_dim)
     sel_key_indices = sel_key_indices.unsqueeze(-1).expand(-1, -1, -1, head_dim)
     if head_sel == "truc":
-        sel_key_states = key_states.gather(dim=2, index=sel_key_indices)
-        sel_value_states = value_states.gather(dim=2, index=sel_key_indices)
+        device = key_states.device
+        sel_key_states = key_states.gather(dim=2, index=sel_key_indices.to(device))
+        sel_value_states = value_states.gather(dim=2, index=sel_key_indices.to(device))
     elif head_sel == "pad":
         kpad = torch.ones((key_states.shape[0], key_states.shape[1], 
                                 1, key_states.shape[3]), dtype=key_states.dtype, 
@@ -222,7 +398,69 @@ def cluster_attn_out(query_states, key_states, value_states, attention_mask, pro
                                 key_states[:, :, prompt_len:, :]], dim=2)
     sel_value_states = torch.cat([value_states[:, :, :sink, :], sel_value_states, 
                                   value_states[:, :, prompt_len:, :]], dim=2)
+    
+    if gqa_policy:
+        # sel_key_states = repeat_kv(sel_key_states, num_key_value_groups)
+        # sel_value_states = repeat_kv(sel_value_states, num_key_value_groups)
+        query_states = query_states.transpose(1, 2)
+        sel_key_states = sel_key_states.transpose(1, 2).contiguous()
+        sel_value_states = sel_value_states.transpose(1, 2).contiguous()
+        attn_output = flash_attn_func(query_states, sel_key_states, sel_value_states, causal=False)
+        attn_output = attn_output.transpose(1, 2).contiguous()
+        attn_output = attn_output.reshape(bsz, q_len, hidden_size)
+        return attn_output, None
+    
+    if os.getenv("NORMAL_ATTN"):
+        assert os.getenv("GET_ATTN") or os.getenv("GET_TOPK")
+        print("in this")
+        attn_weights = torch.matmul(query_states, key_states.transpose(2, 3)) / math.sqrt(head_dim)
+        if os.getenv("GET_TOPK"):
+            _, res_attn_weight = attn_weights.topk(64, dim=-1)
+            print(res_attn_weight.shape)
+    else:
+        attn_weights = torch.matmul(query_states.contiguous(), sel_key_states.transpose(2, 3)) / math.sqrt(head_dim)
 
+    if attention_mask is not None:  # no matter the length, we just slice it
+        causal_mask = attention_mask[:, :, :, : sel_key_states.shape[-2]]
+        attn_weights = attn_weights + causal_mask
+
+    attn_weights = nn.functional.softmax(attn_weights, dim=-1, dtype=torch.float32).to(query_states.dtype)
+    
+    # attn_weights = nn.functional.dropout(attn_weights, p=self.attention_dropout, training=self.training)
+    if os.getenv("NORMAL_ATTN"):
+        attn_output = torch.matmul(attn_weights, value_states)
+    else:
+        attn_output = torch.matmul(attn_weights, sel_value_states)
+
+    if attn_output.size() != (bsz, num_heads, q_len, head_dim):
+        raise ValueError(
+            f"`attn_output` should be of size {(bsz, num_heads, q_len, head_dim)}, but is"
+            f" {attn_output.size()}"
+        )
+
+    if not os.getenv("GET_ATTN") and not os.getenv("GET_TOPK"):
+        attn_weights = None
+    else:
+        if res_attn_weight is None:
+            attn_weights = attn_weights[..., sink:prompt_len]
+        else:
+            attn_weights = res_attn_weight
+        print(attn_weights.shape)
+        
+    attn_output = attn_output.transpose(1, 2).contiguous()
+    attn_output = attn_output.reshape(bsz, q_len, hidden_size)
+    return attn_output, attn_weights
+
+def streaming_attn_out(query_states, key_states, value_states, attention_mask, prompt_len, sink, budget):
+    bsz, _, _, head_dim = key_states.shape
+    _, num_heads, q_len, _ = query_states.shape
+    hidden_size = num_heads * head_dim
+    select_len = budget - sink
+    sel_key_states = torch.cat([key_states[:, :, :sink, :], key_states[:, :, prompt_len-select_len:prompt_len, :], 
+                                key_states[:, :, prompt_len:, :]], dim=2).contiguous()
+    sel_value_states = torch.cat([value_states[:, :, :sink, :], value_states[:, :, prompt_len-select_len:prompt_len, :], 
+                                  value_states[:, :, prompt_len:, :]], dim=2)
+    
     attn_weights = torch.matmul(query_states, sel_key_states.transpose(2, 3)) / math.sqrt(head_dim)
 
     if attention_mask is not None:  # no matter the length, we just slice it
@@ -230,7 +468,7 @@ def cluster_attn_out(query_states, key_states, value_states, attention_mask, pro
         attn_weights = attn_weights + causal_mask
 
     attn_weights = nn.functional.softmax(attn_weights, dim=-1, dtype=torch.float32).to(query_states.dtype)
-    # attn_weights = nn.functional.dropout(attn_weights, p=self.attention_dropout, training=self.training)
+   
     attn_output = torch.matmul(attn_weights, sel_value_states)
 
     if attn_output.size() != (bsz, num_heads, q_len, head_dim):
@@ -246,60 +484,48 @@ def cluster_attn_out(query_states, key_states, value_states, attention_mask, pro
 def forward_cluster(
     self,
     hidden_states: torch.Tensor,
-    attention_mask: Optional[torch.Tensor] = None,
-    position_ids: Optional[torch.LongTensor] = None,
-    past_key_value: Optional[DynamicCache] = None,
-    output_attentions: bool = False,
-    use_cache: bool = False,
+    position_embeddings: Tuple[torch.Tensor, torch.Tensor],
+    attention_mask: Optional[torch.Tensor],
+    past_key_value: Optional[Cache] = None,
+    cache_position: Optional[torch.LongTensor] = None,
     **kwargs,
 ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[Tuple[torch.Tensor]]]:
     bsz, q_len, _ = hidden_states.size()
     assert bsz == 1
 
-    if self.layer_id < 2 or q_len > 1 \
+    if not hasattr(self, "num_heads"):
+        self.num_heads = self.config.num_attention_heads
+        self.num_key_value_heads = self.config.num_key_value_heads
+        self.hidden_size = self.config.hidden_size
+        self.head_dim = self.hidden_size // self.num_heads
+    
+    current_layer = self.layer_idx
+    num_layers = self.config.num_hidden_layers
+    is_heavy_layer = (current_layer == 0) or (current_layer == num_layers - 1)
+    if is_heavy_layer or q_len > 1 \
         or (self.prompt_len == 0 and q_len < self.token_budget) \
-        or (self.prompt_len > 0 and self.prompt_len+q_len < self.token_budget) :   # for first several tokens of ppl_eval
+        or (self.prompt_len > 0 and self.prompt_len+q_len < self.token_budget):   # for first several tokens of ppl_eval
         if q_len > 1:
             self.prompt_len = q_len
             # reset cache for each request
             if self.cache_steps > 0 and self.layer_id >= 2:
                 self.cluster_cache = CacheSimulator(self.layer_id, self.cache_steps+1)
-            if os.getenv("PRE_ROPE") and self.layer_id >= 2:
-                assert self.key_centroids is None
-                key_states = (
-                    self.k_proj(hidden_states)
-                    .view(bsz, q_len, self.num_key_value_heads, self.head_dim)
-                    .transpose(1, 2)
-                )
-                prefill_key = key_states[..., self.sink:, :]
-                if self.nlist == 0:
-                    self.nlist = prefill_key.shape[-2] // 80
-                self.cluster_params = KMeansParams(
-                    n_clusters=self.nlist, 
-                    max_iter=self.cluster_params.max_iter, 
-                    metric="cosine")
-                assert key_states.shape[-2] > self.sink 
-                self.key_centroids, self.cluster_key_indices, \
-                self.cluster_key_ptr, self.cluster_key_size, self.cluster_key_size_ps = \
-                build_cluster(prefill_key, self.nlist, self.balance, 
-                    self.cluster_params, self.num_key_value_groups, self.gqa_policy)
-                if os.getenv("GET_CLUSTERS"):
-                    self.cluster_key = prefill_key
-
+                
         return self.flash_forward(
             hidden_states,
+            position_embeddings,
             attention_mask,
-            position_ids,
             past_key_value,
-            output_attentions,
-            use_cache,
+            cache_position,
             **kwargs,
         )
     
     sink = self.sink
     prefill_key = past_key_value[self.layer_id][0]
+    prefill_value = past_key_value[self.layer_id][1]
     assert prefill_key.shape[-2] > sink
     prefill_key = prefill_key[..., sink:, :]
+    prefill_value = prefill_value[..., sink:, :]
     # clustering for prefilled keys
     if self.key_centroids is None:
         if self.nlist == 0:
@@ -308,10 +534,25 @@ def forward_cluster(
                 n_clusters=self.nlist, 
                 max_iter=self.cluster_params.max_iter, 
                 metric="cosine")
-        self.key_centroids, self.cluster_key_indices, \
-        self.cluster_key_ptr, self.cluster_key_size, self.cluster_key_size_ps = \
-		build_cluster(prefill_key, self.nlist, self.balance, self.cluster_params,
-                    self.num_key_value_groups, self.gqa_policy)
+        if os.getenv("GREEDY"):
+            self.key_centroids, self.cluster_key_indices, \
+            self.cluster_key_ptr, self.cluster_key_size, self.cluster_key_size_ps = \
+            build_cluster_global_greedy(prefill_key, prefill_value, self.nlist, self.balance, self.cluster_params,
+                        self.num_key_value_groups, self.gqa_policy, self.mode)
+        else:
+            import rmm
+
+            # 在导入其他 RAPIDS 库（如 cuml, pylibraft）之前运行
+            # rmm.reinitialize(
+            #     managed_memory=True,  # 开启统一内存，允许使用系统 RAM
+            #     pool_allocator=True,  # 继续使用池化分配器以保持性能
+            #     initial_pool_size=None, # 或者设置为显存的 80% 左右，例如 20*1024**3
+            #     devices=[0] # 指定你的 GPU ID
+            # )
+            self.key_centroids, self.cluster_key_indices, \
+            self.cluster_key_ptr, self.cluster_key_size, self.cluster_key_size_ps, self.all_head_max_indices = \
+            build_cluster(prefill_key, prefill_value, self.nlist, self.balance, self.cluster_params,
+                        self.num_key_value_groups, self.gqa_policy, self.mode)
         if self.cluster_key is None:
             self.cluster_key = prefill_key
 
@@ -331,13 +572,17 @@ def forward_cluster(
         .transpose(1, 2)
     )
 
+    if hasattr(self, "q_norm") and self.q_norm is not None:
+        query_states = self.q_norm(query_states)
+    if hasattr(self, "k_norm") and self.k_norm is not None:
+        key_states = self.k_norm(key_states)
+        
     kv_seq_len = key_states.shape[-2]
     if past_key_value is not None:
         kv_seq_len += past_key_value[self.layer_id][0].shape[-2]
-    cos, sin = self.rotary_emb(value_states, position_ids)
-    query_states_pre_rope = query_states
+    cos, sin = position_embeddings
     query_states, key_states = apply_rotary_pos_emb(
-        query_states, key_states, cos, sin, position_ids
+        query_states, key_states, cos, sin
     )
     # [bsz, nh, t, hd]
 
@@ -345,23 +590,38 @@ def forward_cluster(
         # reuse k, v, self_attention
         key_states, value_states = past_key_value.update(key_states, value_states, self.layer_id)
 
-    key_states = repeat_kv(key_states, self.num_key_value_groups)
-    value_states = repeat_kv(value_states, self.num_key_value_groups)
+    if self.gqa_policy is None:
+        key_states = repeat_kv(key_states, self.num_key_value_groups)
+        value_states = repeat_kv(value_states, self.num_key_value_groups)
 
     token_budget = min(self.prompt_len, self.token_budget)
-    attn_output = cluster_attn_out(
-        query_states, key_states, value_states, attention_mask, 
-        self.prompt_len, self.key_centroids, self.cluster_key_indices, 
-        self.cluster_key_size, self.cluster_key_size_ps,
-        self.num_key_value_groups, self.layer_id, token_budget, 
-        sink, self.head_sel, self.cluster_cache, self.topk_stat, self.cluster_params, query_states_pre_rope, self.total_sel_cluster
-    )
+    if os.getenv("STREAMING"):
+        attn_output = streaming_attn_out(query_states, key_states, value_states, attention_mask,
+                                         self.prompt_len, sink, token_budget)
+    else:
+        attn_output, attn_weights = cluster_attn_out(
+            query_states, key_states, value_states, attention_mask, 
+            self.prompt_len, self.key_centroids, self.cluster_key_indices, 
+            self.cluster_key_size, self.cluster_key_size_ps,
+            self.num_key_value_groups, self.layer_id, token_budget, 
+            sink, self.head_sel, self.cluster_cache, self.topk_stat, self.cluster_params, self.gqa_policy, self.total_sel_cluster
+        )
+
     attn_output = self.o_proj(attn_output)
+    if os.getenv("GET_ATTN") or os.getenv("GET_TOPK"):
+        assert attn_weights is not None
 
-    if not output_attentions:
-        attn_weights = None
+        attn_weights = attn_weights.squeeze(0)
+        if self.attn_weight is None:
+            self.attn_weight = attn_weights
+        else:
+            # padding = torch.zeros((self.attn_weight.shape[0], self.attn_weight.shape[1], 1), device=self.attn_weight.device)
+            # self.attn_weight = torch.cat([self.attn_weight, padding], dim=-1
+            self.attn_weight = torch.cat([self.attn_weight, attn_weights], dim=1)
 
-    return attn_output, attn_weights, past_key_value
+    attn_weights = None
+
+    return attn_output, attn_weights
 
 def split_tensor_along_last_dim(
         tensor: torch.Tensor,
@@ -541,7 +801,7 @@ def forward_cluster_glm(
 
     return output, kv_cache
 
-MAX_POOL_SIZE = 1*1024**3
+MAX_POOL_SIZE = 10*1024**3
 def cluster_reset(model):
     if isinstance(model, PreTrainedModel):
         rmm.reinitialize(pool_allocator=True, initial_pool_size=MAX_POOL_SIZE, maximum_pool_size=MAX_POOL_SIZE)
@@ -555,9 +815,11 @@ def cluster_reset(model):
         module.cluster_key_size = None
         module.cluster_key_size_ps = None
         module.cluster_key = None
-        if os.getenv("GET_CLUSTERS"):
-            module.total_sel_cluster = []
-
+        module.all_head_max_indices = None
+        module.total_sel_cluster = []
+        if os.getenv("GET_ATTN") or os.getenv("GET_TOPK"):
+            module.attn_weight = None
+            
 def apply_cluster_config(module, args):
     nlist = args.nlist
     module.nlist = nlist
@@ -565,6 +827,9 @@ def apply_cluster_config(module, args):
     module.balance = True if args.balance else False
     module.sink = args.sink
     module.gqa_policy = args.gqa_policy
+    module.mode = args.mode
+    if args.window:
+        module.window = args.window
     if args.balance:
         module.cluster_params = ivf_flat.IndexParams(
         n_lists=nlist, metric='inner_product', kmeans_n_iters=args.fit_iter,

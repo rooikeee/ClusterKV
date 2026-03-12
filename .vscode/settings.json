@@ -1,0 +1,5 @@
+{
+    "cmake.sourceDirectory": "/home/zlab/licw/code/ClusterKV/kernel",
+    "python-envs.defaultEnvManager": "ms-python.python:conda",
+    "python-envs.defaultPackageManager": "ms-python.python:conda"
+}
