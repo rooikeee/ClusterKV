@@ -30,7 +30,8 @@ def parse_common_args(parser):
             "ds-r1-llama-8b",
             "qwen-2.5-7b",
             "qwen-2.5-14b",
-            "qwen-3-8b"
+            "qwen-3-8b",
+            "ds-r1-qwen-7b"
         ],
     )
     parser.add_argument("--token_budget", type=int, default=128)

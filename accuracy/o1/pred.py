@@ -59,6 +59,7 @@ def get_pred(
     prompt_format,
     dataset,
     model_name,
+    out_path,
     seed,
 ):
     preds = []
@@ -70,7 +71,6 @@ def get_pred(
         if args.echo:
             echo_reset(model)
         
-        assert model.model.layers[10].self_attn.echo_anchors is None
         pbar.set_description(
             f"Generating for dataset {dataset}, seed {seed}, q_idx {idx+1}"
         )
@@ -100,12 +100,12 @@ def get_pred(
             print("len context length: ", len(output[context_length:]))
             print(pred)
 
-            if args.echo:
-                for idx, layer in enumerate(model.model.layers):
-                    corr_count = layer.self_attn.corr_count
-                    if corr_count > 0:
-                        print(f"layer_idx: {idx}, corr_count {corr_count}")
-                    
+        if args.echo:
+            for idx, layer in enumerate(model.model.layers):
+                corr_count = layer.self_attn.corr_count
+                if corr_count > 0:
+                    print(f"layer_idx: {idx}, corr_count {corr_count}")
+        
         preds.append(
             {
                 "input": prompt,
@@ -115,8 +115,24 @@ def get_pred(
             }
         )   
         
+        with open(out_path, "a", encoding="utf-8") as f:
+            json.dump(preds[-1], f, ensure_ascii=False)
+            f.write("\n")
+
+        if os.getenv("GET_TOPK"):
+            get_topk(model)
+            
     return preds
 
+def get_topk(model: LlamaForCausalLM):
+    save_dir = os.path.join("/state", "partition", "cwli", f"{model_name}", "topk")
+    os.makedirs(save_dir, exist_ok=True)
+    print(save_dir)
+    for layer_idx, layer in enumerate(model.model.layers):
+        if hasattr(layer.self_attn, "attn_weight"):
+            attn_weigths = layer.self_attn.attn_weight
+            torch.save(attn_weigths, os.path.join(save_dir, f"layer-{layer_idx}.pt"))
+            
 def seed_everything(seed):
     torch.manual_seed(seed)
     torch.cuda.manual_seed(seed)
@@ -130,14 +146,14 @@ def load_model_and_tokenizer(path, model_name, device):
     if "intern" in model_name or "qwen" in model_name or "glm4" in model_name:
         tokenizer = AutoTokenizer.from_pretrained(path, trust_remote_code=True)
         model = AutoModelForCausalLM.from_pretrained(
-            path, trust_remote_code=True, torch_dtype=torch.float16,
+            path, trust_remote_code=True, torch_dtype=torch.bfloat16,
             device_map="auto", low_cpu_mem_usage=True,
             attn_implementation="flash_attention_2", use_cache=True
         ).to(device)
     elif "llama" in model_name:
         tokenizer = AutoTokenizer.from_pretrained(path)
         model = LlamaForCausalLM.from_pretrained(
-            path, torch_dtype=torch.float16, device_map="auto", low_cpu_mem_usage=True,
+            path, torch_dtype=torch.bfloat16, device_map="auto", low_cpu_mem_usage=True,
             attn_implementation="flash_attention_2", use_cache=True
         )
     else:
@@ -191,6 +207,8 @@ if __name__ == "__main__":
         prompt_format += "<Thought> {thought} </Thought>\n"
     
     res_dir = os.path.join("accuracy", "o1", "results")
+    if args.data_idx:
+        res_dir = os.path.join("accuracy", "o1", "debug")
     os.makedirs(res_dir, exist_ok=True)
     config_affix = get_config_output_affix(args)
     os.makedirs(os.path.join(res_dir, model_name), exist_ok=True)
@@ -206,10 +224,6 @@ if __name__ == "__main__":
             prompt_format,
             dataset,
             model_name,
+            out_path,
             seed=args.seed,
         )
-    
-    with open(out_path, "w", encoding="utf-8") as f:
-        for pred in preds:
-            json.dump(pred, f, ensure_ascii=False)
-            f.write("\n")

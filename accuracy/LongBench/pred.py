@@ -42,7 +42,7 @@ def get_pred(
     preds = []
     pbar = tqdm(data)
     if os.getenv("GET_TOPK"):
-        max_gen = 256
+        max_gen = 512
         
     for idx, json_obj in enumerate(pbar):
         pbar.set_description(

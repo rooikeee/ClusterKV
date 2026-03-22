@@ -247,9 +247,11 @@ def echokv_llama_forward(self, hidden_states, position_embeddings, attention_mas
 
     current_layer = self.layer_idx
     num_layers = self.config.num_hidden_layers
-    # is_heavy_layer = (current_layer == 0) or (current_layer == num_layers - 1)
-    is_heavy_layer = (current_layer == 0) or (current_layer == num_layers-1) or (current_layer == 13)
-    # is_heavy_layer = (current_layer == 1) or (current_layer == 2) or (current_layer == 3)
+   
+    heavy_layers = [0, 1, num_layers-1, num_layers-2]
+    is_heavy_layer = current_layer in heavy_layers 
+    
+    # is_heavy_layer = (current_layer == 0) or (current_layer == num_layers-1) or (current_layer == 13)
 
     if self.num_pages == 0 and not is_heavy_layer:
         max_page_size = 128 * 1024
@@ -301,8 +303,55 @@ def echokv_llama_forward(self, hidden_states, position_embeddings, attention_mas
 
     total_seq_len = key_states.shape[1]
     num_q_per_kv = self.num_heads // self.num_key_value_heads
+    
+    scale = 1.0 / math.sqrt(self.head_dim)
+    if os.getenv("GET_TOPK"):
+        # 提取转置后的张量用于矩阵乘法 [bsz, heads, seq_len, head_dim]
+        q_t = query_states.transpose(1, 2)
+        k_t = key_states.transpose(1, 2)
+        v_t = value_states.transpose(1, 2)
+        
+        # GQA 广播，将 KV 头数复制对齐到 Q 头数
+        k_rep = repeat_kv(k_t, num_q_per_kv)
+        v_rep = repeat_kv(v_t, num_q_per_kv)
+        
+        # 1. 计算原生 Attention Scores
+        attn_scores = torch.matmul(q_t, k_rep.transpose(-1, -2)) * scale
+        
+        # 2. 加上 causal mask (处理 prefill 阶段)
+        if attention_mask is not None:
+            attn_scores = attn_scores + attention_mask
+            
+        # 3. Softmax 获取真实权重
+        attn_weights = torch.softmax(attn_scores, dim=-1)
+        
+        # 4. 乘上 V 得到输出
+        attn_output = torch.matmul(attn_weights, v_rep)
+        
+        # ------------------------------------------
+        # 🌟 核心探针：只在 Decoding 阶段 (q_len == 1) 收集 Top-K
+        # ------------------------------------------
+        q_len = query_states.shape[1]
+        if q_len == 1:
+            top_k_num = min(64, attn_weights.shape[-1]) # 防止初始序列长度不足 64
+            # 拿到 top 64 的 indices, 形状: [bsz, q_heads, 1, 64]
+            _, topk_indices = torch.topk(attn_weights, k=top_k_num, dim=-1)
+            
+            topk_indices = topk_indices.squeeze(0)
+            # 使用 cat 进行时间步(dim=2)上的拼接
+            if getattr(self, "attn_weight", None) is None:
+                self.attn_weight = topk_indices
+            else:
+                self.attn_weight = torch.cat([self.attn_weight, topk_indices], dim=1)
+                print(self.attn_weight.shape)
+        
+        # 返回原生结果
+        self.decode_step += 1
+        attn_output = attn_output.transpose(1, 2).contiguous().reshape(bsz, q_len, self.hidden_size)
+        return self.o_proj(attn_output), None
+    
     # 动态上下文判断
-    is_prefill = q_len > 1 or self.echo_anchors is None
+    is_prefill = q_len > 1
     middle_start = self.sink
     middle_end = total_seq_len - self.window
     middle_len = middle_end - middle_start
@@ -310,14 +359,19 @@ def echokv_llama_forward(self, hidden_states, position_embeddings, attention_mas
 
     self.past_query = query_states.clone()
     scale = 1.0 / math.sqrt(self.head_dim)
-    # ==========================================
-    # 🌟 路由 A：全量注意力 (Prefill / 短文本 / 首尾层)
-    # ==========================================
+    
+    if not is_heavy_layer:
+        self.update_page_digest(key_states)
     if is_prefill or is_short_context or is_heavy_layer:
         attn_output = flash_attn_func(query_states, key_states, value_states, causal=is_prefill)
-        
-        if is_prefill and not is_short_context and not is_heavy_layer:
+
+    else:
+        assert q_len == 1
+        k_t = key_states.transpose(1, 2)
+        v_t = value_states.transpose(1, 2)
+        if self.echo_anchors is None:
             # init page digest
+            attn_output = flash_attn_func(query_states, key_states, value_states, causal=False)
             key_states = key_states.transpose(1, 2)
             query_states = query_states.transpose(1, 2)
             last_query = query_states[:, :, -1:, :]
@@ -339,159 +393,141 @@ def echokv_llama_forward(self, hidden_states, position_embeddings, attention_mas
             
             self.echo_anchors = rel_anchors + middle_start
 
-    # ==========================================
-    # 🌟 路由 B：EchoKV 极速解码 (中间层 + q_len == 1)
-    # ==========================================
-    else:
-        # 1. 边界计算
-        device = query_states.device
-        q_per_kv = self.num_heads // self.num_key_value_heads
-        q_grouped = query_states.transpose(1, 2).view(bsz, self.num_key_value_heads, q_per_kv, 1, self.head_dim).mean(dim=2)
+        # ==========================================
+        # 🌟 路由 B：EchoKV 极速解码 (中间层 + q_len == 1)
+        # ==========================================
+        else:
+            # 1. 边界计算
+            device = query_states.device
+            q_per_kv = self.num_heads // self.num_key_value_heads
+            q_grouped = query_states.transpose(1, 2).view(bsz, self.num_key_value_heads, q_per_kv, 1, self.head_dim).mean(dim=2)
 
-        # 2. Gather 内存拉取 (由于我们要按 seq_len 拉取，先转成 [bsz, kv_heads, seq_len, head_dim] 方便 gather)
-        k_t = key_states.transpose(1, 2)
-        v_t = value_states.transpose(1, 2)
-        # current_pages_num = self.num_pages
-        offsets = torch.arange(self.page_size, device=query_states.device)
+                # current_pages_num = self.num_pages
+            offsets = torch.arange(self.page_size, device=query_states.device)
 
-        full = False
-        if self.decode_step % self.page_size == 0:
-            # update anchors
-            # min_k_for_sel = self.min_k[:, :self.num_pages - self.num_window_pages, ...]
-            # max_k_for_sel = self.max_k[:, :self.num_pages - self.num_window_pages, ...]
-            # max_qk = quest_sel(query_states, min_k_for_sel, max_k_for_sel, \
-            #                    self.gqa_policy, self.num_heads, self.num_key_value_heads)
-            # _, sel_page_indices = torch.topk(max_qk, self.page_budget)
-            # starts = self.sink + sel_page_indices.unsqueeze(0) * self.page_size
-        
-            # # [bsz, num_kv_heads, page_budget, page_size]
-            # sel_token_indices = (self.sink + sel_page_indices*self.page_size).unsqueeze(-1).expand(-1, -1, -1, self.page_size)
-            # sel_token_indices = sel_token_indices + torch.arange(
-            #     self.page_size, device=sel_token_indices.device
-            # ).reshape(1, 1, 1, self.page_size)
-
-            # # [bsz, num_kv_heads, num_sel_token, head_dim]
-            # gather_indices = sel_token_indices.reshape(
-            #     sel_token_indices.shape[0], sel_token_indices.shape[1], -1
-            # ).unsqueeze(-1).expand(-1, -1, -1, self.head_dim)
-            full = True
-            q_t = query_states.transpose(1, 2)
-            key_states_rep = repeat_kv(k_t, num_q_per_kv)
-            scale = 1.0 / math.sqrt(self.head_dim)
-              
-            # 仅仅对这一行做 matmul，拿到我们梦寐以求的概率波
-            last_scores = torch.matmul(q_t, key_states_rep.transpose(2, 3)) * scale
-            last_weights = torch.softmax(last_scores, dim=-1)
+            full = False
+            if self.decode_step % self.page_size == 0:
+                # update anchors
+                min_k_for_sel = self.min_k[:, :self.num_pages - self.num_window_pages, ...]
+                max_k_for_sel = self.max_k[:, :self.num_pages - self.num_window_pages, ...]
+                max_qk = quest_sel(query_states, min_k_for_sel, max_k_for_sel, \
+                                self.gqa_policy, self.num_heads, self.num_key_value_heads)
+                _, sel_page_indices = torch.topk(max_qk, self.page_budget)
+                starts = self.sink + sel_page_indices.unsqueeze(0) * self.page_size
             
-            # 切出中间那段广袤的区域
-            last_weights_middle = last_weights[:, :, :, middle_start:middle_end] # [1, num_heads, 1, middle_len]
-            
-            # GQA 分组求平均
-            kv_grouped_weights = last_weights_middle.view(1, self.num_key_value_heads, num_q_per_kv, -1).mean(dim=2).squeeze(0) # [kv_heads, middle_len]
-            
-            # 独立 NMS 空降！
-            rel_anchors = echokv_get_initial_anchors_kv(kv_grouped_weights, self.echo_num_anchors, self.page_size // 2)
-               
-            self.echo_anchors = rel_anchors + middle_start
-       
-        starts = echokv_bidirectional_boundaries_kv(self.echo_anchors, self.page_size, middle_start, middle_end)
-        indices = starts.unsqueeze(-1) + offsets
-        indices_flat = indices.view(1, self.num_key_value_heads, -1)
-        gather_indices = indices_flat.unsqueeze(-1).expand(-1, -1, -1, self.head_dim)
-        
-        echo_k = torch.gather(k_t, dim=2, index=gather_indices)
-        echo_v = torch.gather(v_t, dim=2, index=gather_indices)
-        
-        sink_k, sink_v = k_t[:, :, :self.sink, :], v_t[:, :, :self.sink, :]
-        window_k, window_v = k_t[:, :, -self.window:, :], v_t[:, :, -self.window:, :]
-        
-        local_k_trans = torch.cat([sink_k, echo_k, window_k], dim=2)
-        local_v_trans = torch.cat([sink_v, echo_v, window_v], dim=2)
-       
-        # # [bsz, kv_heads, 1, total_budget] 
-        # # local_k_trans_rep = repeat_kv(local_k_trans, num_q_per_kv)
-        # # track_scores = torch.matmul(query_states, local_k_trans_rep.transpose(-1, -2)) * scale
-        
-        # track_scores = torch.matmul(q_grouped, local_k_trans.transpose(2, 3)) * scale
-        # if os.getenv("GET_CORR"):
-        #     local_k_trans_sp = repeat_kv(local_k_trans, self.num_key_value_groups)
-        #     tmp_scores = torch.matmul(query_states, local_k_trans_sp.transpose(-1, -2)) * scale
-        #     local_attn_weights_kv = torch.softmax(tmp_scores, dim=-1)
-        #     gini_impurity = 1.0 - torch.sum(local_attn_weights_kv ** 2, dim=-1).mean()
-            
-        #     if gini_impurity > self.corr_threshold:
-        #         self.corr_count += 1
-            
-        # absolute_indices = starts.unsqueeze(-1) + offsets # [kv_heads, num_anchors, page_size]
-        # flat_scores = track_scores[0, :, :, self.sink : self.sink + (self.echo_num_anchors * self.page_size)].squeeze(-2).clone()                 # [kv_heads, num_anchors * page_size]
-        # flat_indices = absolute_indices.view(self.num_key_value_heads, -1)
-        
-        
-        # # 使用极速雷达池化引擎进行洗牌！惩罚半径拉满至 32 防扎堆！
-        # self.echo_anchors = echokv_triton_exact_nms(
-        #     flat_scores=flat_scores, 
-        #     flat_indices=flat_indices, 
-        #     num_anchors=self.echo_num_anchors, 
-        #     suppression_radius=self.page_size // 2, 
-        #     old_anchors=self.echo_anchors
-        # )     
-
-        local_k_trans_rep = repeat_kv(local_k_trans, self.num_key_value_groups)
-        
-        # 2. 精确打击：计算每个 Query Head 独立的原始分数
-        # query_states: [bsz, q_heads, 1, head_dim]
-        # local_k_trans_rep: [bsz, q_heads, total_budget, head_dim]
-        track_scores = torch.matmul(query_states.transpose(1, 2), local_k_trans_rep.transpose(-1, -2)) * scale
-        
-        # 3. 🌟 核心改变：在 Query Head 级别应用 Softmax (归一化选票)
-        track_probs = torch.softmax(track_scores, dim=-1) # [bsz, q_heads, 1, total_budget]
-        if os.getenv("GET_CORR"):
-            # 如果需要计算基尼不纯度，可以直接复用算好的 track_probs
-            gini_impurity = 1.0 - torch.sum(track_probs ** 2, dim=-1).mean()
-            if gini_impurity > self.corr_threshold:
-                self.corr_count += 1
+                q_t = query_states.transpose(1, 2)
+                key_states_rep = repeat_kv(k_t, num_q_per_kv)
+                scale = 1.0 / math.sqrt(self.head_dim)
                 
-        # 4. 🌟 民主聚合：将概率按 Group 聚合回 KV Head
-        bsz, q_heads, _, total_budget = track_probs.shape
-        # Reshape 切分维度: [bsz, kv_heads, num_q_per_kv, total_budget]
-        track_probs_grouped = track_probs.view(bsz, self.num_key_value_heads, self.num_key_value_groups, total_budget)
-        
-        # 对 group 维度求平均，得到 KV Head 收到的综合概率投票！
-        kv_track_probs = track_probs_grouped.mean(dim=2) # [bsz, kv_heads, total_budget]
-        
-        # 5. 提取中间区域的“概率”交给 NMS 引擎
-        echo_start = self.sink
-        echo_end = self.sink + (self.echo_num_anchors * self.page_size)
-        
-        absolute_indices = starts.unsqueeze(-1) + offsets # [kv_heads, num_anchors, page_size]
-        
-        # 注意：现在提取的是经过 Softmax 和 Mean 之后的概率！
-        flat_probs = kv_track_probs[0, :, echo_start:echo_end].clone() # [kv_heads, num_anchors * page_size]
-        flat_indices = absolute_indices.view(self.num_key_value_heads, -1)
-        
-        # 6. 使用极速雷达池化引擎进行洗牌！
-        self.echo_anchors = echokv_triton_exact_nms(
-            flat_scores=flat_probs,  # 喂进去的是 [0,1] 的民主选票
-            flat_indices=flat_indices, 
-            num_anchors=self.echo_num_anchors, 
-            suppression_radius=self.page_size // 2, 
-            old_anchors=self.echo_anchors
-        )
+                last_scores = torch.matmul(q_t, key_states_rep.transpose(2, 3)) * scale
+                last_weights = torch.softmax(last_scores, dim=-1)
+                # 切出中间那段广袤的区域
+                last_weights_middle = last_weights[:, :, :, middle_start:middle_end] # [1, num_heads, 1, middle_len]
+                
+                # GQA 分组求平均
+                kv_grouped_weights = last_weights_middle.view(1, self.num_key_value_heads, num_q_per_kv, -1).mean(dim=2).squeeze(0) # [kv_heads, middle_len]
+                # kv_grouped_weights_sum = kv_grouped_weights.view(self.num_key_value_heads, middle_len // self.page_size, -1).sum(dim=-1) # [kv_heads, middle_page_len]
+                _, gather_indices = torch.topk(kv_grouped_weights, self.token_budget-self.sink-self.window, dim=-1)
 
-        # 4. 极致生成：FlashAttention 收尾
-        # 转回 FlashAttention 要求的格式 [bsz, seq_len, kv_heads, head_dim]，连续化物理显存
-        if full:
-            local_k_fa = key_states.contiguous()
-            local_v_fa = value_states.contiguous()
-        local_k_fa = local_k_trans.transpose(1, 2).contiguous()
-        local_v_fa = local_v_trans.transpose(1, 2).contiguous()
-        
-        # 原生 FlashAttention 自动处理 GQA 广播，极速完成计算！
-        attn_output = flash_attn_func(query_states, local_k_fa, local_v_fa, causal=False)
+                gather_indices = gather_indices.unsqueeze(0).unsqueeze(-1).expand(-1, -1, -1, self.head_dim)
+            
+                # # 独立 NMS 空降！
+                # rel_anchors = echokv_get_initial_anchors_kv(kv_grouped_weights, self.echo_num_anchors, self.page_size // 2)
+                
+                # self.echo_anchors = rel_anchors + middle_start
+                
+            else:
 
-    # ==========================================
-    # 3. 输出格式化
-    # ==========================================
+                starts = echokv_bidirectional_boundaries_kv(self.echo_anchors, self.page_size, middle_start, middle_end)
+                starts = starts.to(offsets.device)
+                indices = starts.unsqueeze(-1) + offsets
+                indices_flat = indices.view(1, self.num_key_value_heads, -1)
+                gather_indices = indices_flat.unsqueeze(-1).expand(-1, -1, -1, self.head_dim)
+            
+            assert gather_indices is not None
+            echo_k = torch.gather(k_t, dim=2, index=gather_indices)
+            echo_v = torch.gather(v_t, dim=2, index=gather_indices)
+            
+            sink_k, sink_v = k_t[:, :, :self.sink, :], v_t[:, :, :self.sink, :]
+            window_k, window_v = k_t[:, :, -self.window:, :], v_t[:, :, -self.window:, :]
+            
+            local_k_trans = torch.cat([sink_k, echo_k, window_k], dim=2)
+            local_v_trans = torch.cat([sink_v, echo_v, window_v], dim=2)
+        
+            # # [bsz, kv_heads, 1, total_budget] 
+            # # local_k_trans_rep = repeat_kv(local_k_trans, num_q_per_kv)
+            # # track_scores = torch.matmul(query_states, local_k_trans_rep.transpose(-1, -2)) * scale
+            
+            # track_scores = torch.matmul(q_grouped, local_k_trans.transpose(2, 3)) * scale
+            # if os.getenv("GET_CORR"):
+            #     local_k_trans_sp = repeat_kv(local_k_trans, self.num_key_value_groups)
+            #     tmp_scores = torch.matmul(query_states, local_k_trans_sp.transpose(-1, -2)) * scale
+            #     local_attn_weights_kv = torch.softmax(tmp_scores, dim=-1)
+            #     gini_impurity = 1.0 - torch.sum(local_attn_weights_kv ** 2, dim=-1).mean()
+                
+            #     if gini_impurity > self.corr_threshold:
+            #         self.corr_count += 1
+                
+            # absolute_indices = starts.unsqueeze(-1) + offsets # [kv_heads, num_anchors, page_size]
+            # flat_scores = track_scores[0, :, :, self.sink : self.sink + (self.echo_num_anchors * self.page_size)].squeeze(-2).clone()                 # [kv_heads, num_anchors * page_size]
+            # flat_indices = absolute_indices.view(self.num_key_value_heads, -1)
+            
+            # # 使用极速雷达池化引擎进行洗牌！惩罚半径拉满至 32 防扎堆！
+            # self.echo_anchors = echokv_triton_exact_nms(
+            #     flat_scores=flat_scores, 
+            #     flat_indices=flat_indices, 
+            #     num_anchors=self.echo_num_anchors, 
+            #     suppression_radius=self.page_size // 2, 
+            #     old_anchors=self.echo_anchors
+            # )     
+
+            local_k_trans_rep = repeat_kv(local_k_trans, self.num_key_value_groups)
+            
+            # query_states: [bsz, q_heads, 1, head_dim]
+            # local_k_trans_rep: [bsz, q_heads, total_budget, head_dim]
+            track_scores = torch.matmul(query_states.transpose(1, 2), local_k_trans_rep.transpose(-1, -2)) * scale
+            
+            track_probs = torch.softmax(track_scores, dim=-1) # [bsz, q_heads, 1, total_budget]
+            if os.getenv("GET_CORR"):
+                # 如果需要计算基尼不纯度，可以直接复用算好的 track_probs
+                gini_impurity = 1.0 - torch.sum(track_probs ** 2, dim=-1).mean()
+                if gini_impurity > self.corr_threshold:
+                    self.corr_count += 1
+                    
+            bsz, q_heads, _, total_budget = track_probs.shape
+            # Reshape 切分维度: [bsz, kv_heads, num_q_per_kv, total_budget]
+            track_probs_grouped = track_probs.view(bsz, self.num_key_value_heads, self.num_key_value_groups, total_budget)
+            
+            # 对 group 维度求平均，得到 KV Head 收到的综合概率投票！
+            kv_track_probs = track_probs_grouped.mean(dim=2) # [bsz, kv_heads, total_budget]
+            
+            echo_start = self.sink
+            echo_end = self.sink + (self.echo_num_anchors * self.page_size)
+            
+            absolute_indices = starts.unsqueeze(-1) + offsets # [kv_heads, num_anchors, page_size]
+            
+            # 注意：现在提取的是经过 Softmax 和 Mean 之后的概率！
+            flat_probs = kv_track_probs[:, :, echo_start:echo_end].squeeze(0).clone().to("cuda:0") # [kv_heads, num_anchors * page_size]
+            flat_indices = absolute_indices.view(self.num_key_value_heads, -1).to("cuda:0")
+            flat_probs = flat_probs.contiguous()
+            flat_indices = flat_indices.contiguous()
+    
+            self.echo_anchors = echokv_triton_exact_nms(
+                flat_scores=flat_probs,  # 喂进去的是 [0,1] 的民主选票
+                flat_indices=flat_indices, 
+                num_anchors=self.echo_num_anchors, 
+                suppression_radius=self.page_size // 2, 
+                old_anchors=self.echo_anchors.to("cuda:0")
+            )
+
+            # 转回 FlashAttention 要求的格式 [bsz, seq_len, kv_heads, head_dim]，连续化物理显存
+
+            local_k_fa = local_k_trans.transpose(1, 2).contiguous()
+            local_v_fa = local_v_trans.transpose(1, 2).contiguous()
+            
+            # 原生 FlashAttention 自动处理 GQA 广播，极速完成计算！
+            attn_output = flash_attn_func(query_states, local_k_fa, local_v_fa, causal=False).to("cuda:0")
+
     # attn_output 本来就是 [bsz, q_len, heads, head_dim]，只需 reshape
     self.decode_step += 1
     attn_output = attn_output.reshape(bsz, q_len, self.hidden_size)
@@ -503,7 +539,7 @@ def apply_echo_config(module, args):
     module.window = args.window
     module.echo_anchors = None
     module.echo_num_anchors = (args.token_budget-args.sink-args.window) // args.chunk_size
-    module.corr_threshold = 0.95
+    module.corr_threshold = 0.9
     module.corr_count = 0
     module.num_heads = module.config.num_attention_heads
     module.num_key_value_heads = module.config.num_key_value_heads

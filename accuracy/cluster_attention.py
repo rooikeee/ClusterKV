@@ -415,7 +415,7 @@ def cluster_attn_out(query_states, key_states, value_states, attention_mask, pro
         print("in this")
         attn_weights = torch.matmul(query_states, key_states.transpose(2, 3)) / math.sqrt(head_dim)
         if os.getenv("GET_TOPK"):
-            _, res_attn_weight = attn_weights.topk(64, dim=-1)
+            _, res_attn_weight = attn_weights.topk(128, dim=-1)
             print(res_attn_weight.shape)
     else:
         attn_weights = torch.matmul(query_states.contiguous(), sel_key_states.transpose(2, 3)) / math.sqrt(head_dim)
@@ -442,7 +442,7 @@ def cluster_attn_out(query_states, key_states, value_states, attention_mask, pro
         attn_weights = None
     else:
         if res_attn_weight is None:
-            attn_weights = attn_weights[..., sink:prompt_len]
+            attn_weights = attn_weights[..., sink:-sink]
         else:
             attn_weights = res_attn_weight
         print(attn_weights.shape)
@@ -616,7 +616,7 @@ def forward_cluster(
             self.attn_weight = attn_weights
         else:
             # padding = torch.zeros((self.attn_weight.shape[0], self.attn_weight.shape[1], 1), device=self.attn_weight.device)
-            # self.attn_weight = torch.cat([self.attn_weight, padding], dim=-1
+            # self.attn_weight = torch.cat([self.attn_weight, padding], dim=-1)
             self.attn_weight = torch.cat([self.attn_weight, attn_weights], dim=1)
 
     attn_weights = None
