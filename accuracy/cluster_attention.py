@@ -299,9 +299,11 @@ def cluster_attn_out(query_states, key_states, value_states, attention_mask, pro
     _, num_heads, q_len, _ = query_states.shape
     hidden_size = num_heads * head_dim
 
+    include_decode_generated_tokens = prompt_len > token_budget
     sink = min(sink, kv_seq_len)
     local_window = max(local_window, 0)
-    local_start = max(sink, kv_seq_len - local_window) if local_window > 0 else kv_seq_len
+    local_end = kv_seq_len if include_decode_generated_tokens else min(prompt_len, kv_seq_len)
+    local_start = max(sink, local_end - local_window) if local_window > 0 else local_end
     cluster_budget = max(token_budget - sink, 0)
 
     has_cluster_tokens = (
@@ -430,8 +432,8 @@ def cluster_attn_out(query_states, key_states, value_states, attention_mask, pro
         sel_key_states = key_states[:, :, :0, :]
         sel_value_states = value_states[:, :, :0, :]
 
-    recent_key_states = key_states[:, :, local_start:, :]
-    recent_value_states = value_states[:, :, local_start:, :]
+    recent_key_states = key_states[:, :, local_start:local_end, :]
+    recent_value_states = value_states[:, :, local_start:local_end, :]
     sel_key_states = torch.cat([key_states[:, :, :sink, :], sel_key_states, recent_key_states], dim=2)
     sel_value_states = torch.cat([value_states[:, :, :sink, :], sel_value_states, recent_value_states], dim=2)
 
@@ -487,10 +489,15 @@ def streaming_attn_out(query_states, key_states, value_states, attention_mask, p
     _, num_heads, q_len, _ = query_states.shape
     hidden_size = num_heads * head_dim
     select_len = budget - sink
-    sel_key_states = torch.cat([key_states[:, :, :sink, :], key_states[:, :, prompt_len-select_len:prompt_len, :], 
-                                key_states[:, :, prompt_len:, :]], dim=2).contiguous()
-    sel_value_states = torch.cat([value_states[:, :, :sink, :], value_states[:, :, prompt_len-select_len:prompt_len, :], 
-                                  value_states[:, :, prompt_len:, :]], dim=2)
+    include_decode_generated_tokens = prompt_len > budget
+    prompt_tail_start = max(0, prompt_len - select_len)
+    pieces_k = [key_states[:, :, :sink, :], key_states[:, :, prompt_tail_start:prompt_len, :]]
+    pieces_v = [value_states[:, :, :sink, :], value_states[:, :, prompt_tail_start:prompt_len, :]]
+    if include_decode_generated_tokens:
+        pieces_k.append(key_states[:, :, prompt_len:, :])
+        pieces_v.append(value_states[:, :, prompt_len:, :])
+    sel_key_states = torch.cat(pieces_k, dim=2).contiguous()
+    sel_value_states = torch.cat(pieces_v, dim=2)
     
     attn_weights = torch.matmul(query_states, sel_key_states.transpose(2, 3)) / math.sqrt(head_dim)
 
@@ -532,6 +539,9 @@ def maybe_append_decode_clusters(self, key_states, value_states, sink):
     update_interval = getattr(self, "cluster_update_interval", 320)
     append_nlist = getattr(self, "cluster_update_nlist", 4)
     if update_interval <= 0 or append_nlist <= 0:
+        return
+    # Only keep decode-generated tokens when prompt is longer than token budget.
+    if self.prompt_len <= self.token_budget:
         return
 
     generated_len = key_states.shape[-2] - self.prompt_len

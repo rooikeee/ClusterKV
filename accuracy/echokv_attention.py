@@ -507,8 +507,8 @@ def echokv_llama_forward(self, hidden_states, position_embeddings, attention_mas
             absolute_indices = starts.unsqueeze(-1) + offsets # [kv_heads, num_anchors, page_size]
             
             # 注意：现在提取的是经过 Softmax 和 Mean 之后的概率！
-            flat_probs = kv_track_probs[:, :, echo_start:echo_end].squeeze(0).clone().to("cuda:0") # [kv_heads, num_anchors * page_size]
-            flat_indices = absolute_indices.view(self.num_key_value_heads, -1).to("cuda:0")
+            flat_probs = kv_track_probs[:, :, echo_start:echo_end].squeeze(0).clone().to(device) # [kv_heads, num_anchors * page_size]
+            flat_indices = absolute_indices.view(self.num_key_value_heads, -1).to(device)
             flat_probs = flat_probs.contiguous()
             flat_indices = flat_indices.contiguous()
     
@@ -517,7 +517,7 @@ def echokv_llama_forward(self, hidden_states, position_embeddings, attention_mas
                 flat_indices=flat_indices, 
                 num_anchors=self.echo_num_anchors, 
                 suppression_radius=self.page_size // 2, 
-                old_anchors=self.echo_anchors.to("cuda:0")
+                old_anchors=self.echo_anchors.to(device)
             )
 
             # 转回 FlashAttention 要求的格式 [bsz, seq_len, kv_heads, head_dim]，连续化物理显存
@@ -526,7 +526,7 @@ def echokv_llama_forward(self, hidden_states, position_embeddings, attention_mas
             local_v_fa = local_v_trans.transpose(1, 2).contiguous()
             
             # 原生 FlashAttention 自动处理 GQA 广播，极速完成计算！
-            attn_output = flash_attn_func(query_states, local_k_fa, local_v_fa, causal=False).to("cuda:0")
+            attn_output = flash_attn_func(query_states, local_k_fa, local_v_fa, causal=False).to(device)
 
     # attn_output 本来就是 [bsz, q_len, heads, head_dim]，只需 reshape
     self.decode_step += 1
@@ -553,7 +553,7 @@ def echo_reset(model):
     for name, module in reversed(model._modules.items()):
         if len(list(module.children())) > 0:
             echo_reset(module)
-    module.corr_count = 0
-    module.echo_anchors = None
-    module.num_pages = 0
-    module.decode_step = 0
+        module.corr_count = 0
+        module.echo_anchors = None
+        module.num_pages = 0
+        module.decode_step = 0
