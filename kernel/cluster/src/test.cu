@@ -1,6 +1,8 @@
 #include "km_ops.h"
 #include "pytorch_extension_utils.h"
 #include "flashinfer/utils.cuh"
+#include <c10/cuda/CUDAGuard.h>
+#include <c10/cuda/CUDAStream.h>
 
 
 __global__ void
@@ -94,6 +96,9 @@ void search_indices(torch::Tensor num_need_clusters,
 	size_t prefill_len = cluster_key_indices.size(1);
 	int max_num_need_clusters = sel_cluster_key_start.size(1);
 	size_t max_num_indices = sel_key_indices.size(1);
+	const auto device_index = static_cast<c10::DeviceIndex>(sel_key_indices.get_device());
+	const c10::cuda::CUDAGuard device_guard(device_index);
+	cudaStream_t stream = c10::cuda::getCurrentCUDAStream(device_index).stream();
 
 	cudaError_t status = KMeansSearchIndices(
 		static_cast<int64_t*>(num_need_clusters.data_ptr()),
@@ -105,7 +110,8 @@ void search_indices(torch::Tensor num_need_clusters,
 		num_heads, num_kv_heads, 
 		prefill_len,
 		max_num_need_clusters,
-		max_num_indices
+		max_num_indices,
+		stream
 	);
 
 	TORCH_CHECK(status == cudaSuccess,

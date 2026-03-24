@@ -351,7 +351,13 @@ def cluster_attn_out(query_states, key_states, value_states, attention_mask, pro
         if cluster_cache is not None:
             cluster_cache.update(sel_cluster_indices)
 
-        use_search_kernel = True
+        # NOTE:
+        # `search_indices` custom CUDA kernel may be unsafe in single-process multi-GPU
+        # when the extension is built without proper device guard/stream handling.
+        # Keep accuracy-first fallback for multi-GPU runs.
+        use_search_kernel = torch.cuda.device_count() <= 1
+        if os.getenv("FORCE_SEARCH_KERNEL") == "1":
+            use_search_kernel = True
         if use_search_kernel:
             max_num_indices = torch.sum(sel_cluster_size, dim=-1).max()
             if gqa_policy:
@@ -360,12 +366,14 @@ def cluster_attn_out(query_states, key_states, value_states, attention_mask, pro
             else:
                 sel_key_indices = torch.full((num_heads, max_num_indices), kv_seq_len,
                                             dtype=torch.int64, device=key_states.device)
-            search_indices(num_need_clusters,
-                        sel_cluster_size_ps,
-                        sel_cluster_key_start,
-                        sel_cluster_key_end,
-                        cluster_key_indices,
-                        sel_key_indices)
+            # Important for multi-GPU: launch the custom kernel on the tensor's device context.
+            with torch.cuda.device(sel_key_indices.device):
+                search_indices(num_need_clusters,
+                            sel_cluster_size_ps,
+                            sel_cluster_key_start,
+                            sel_cluster_key_end,
+                            cluster_key_indices,
+                            sel_key_indices)
             sel_key_indices = sel_key_indices[:, :cluster_budget]
         else:
             sel_key_indices = []
