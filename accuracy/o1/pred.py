@@ -23,6 +23,12 @@ def parse_args(args=None):
     parser = parse_common_args(parser)
     parser.add_argument("--e", action="store_true", help="Evaluate on LongBench-E")
     parser.add_argument("--task", type=str, help="task name", default=None)
+    parser.add_argument(
+        "--ext_data_dir",
+        type=str,
+        default=None,
+        help="External dataset dir (e.g., FreeKV/eval/datasets). Auto-detects if not set.",
+    )
     parser.add_argument("--debug", action="store_true")
     parser.add_argument("--data_idx", type=int, default=None)
     parser.add_argument("--max_gen", type=int, default=1024 * 16)
@@ -32,23 +38,80 @@ def parse_args(args=None):
     return parser.parse_args(args)
 
 
+def _candidate_dataset_dirs(ext_data_dir=None):
+    cands = []
+    if ext_data_dir:
+        cands.append(ext_data_dir)
+    cands.extend(
+        [
+            os.path.join(os.getcwd(), "accuracy", "o1", "datasets"),
+            os.path.join(os.getcwd(), "eval", "datasets"),
+            r"D:\code\FreeKV\eval\datasets",
+            "/home/zlab/licw/code/FreeKV/eval/datasets",
+        ]
+    )
+    # dedup while preserving order
+    uniq = []
+    for c in cands:
+        if c not in uniq:
+            uniq.append(c)
+    return uniq
+
+
+def _resolve_dataset_file(task, ext_data_dir=None):
+    task_l = task.lower()
+    task_alias = {
+        "longgenbench": "longgenbench",
+        "lgbench": "longgenbench",
+        "gov_report": "gov_report",
+    }
+    normalized = task_alias.get(task_l, task)
+    file_candidates = [f"{normalized}.jsonl", f"{normalized}.json", f"{task}.jsonl", f"{task}.json"]
+    for ds_dir in _candidate_dataset_dirs(ext_data_dir):
+        for fn in file_candidates:
+            path = os.path.join(ds_dir, fn)
+            if os.path.exists(path):
+                return path
+    raise FileNotFoundError(
+        f"Dataset file for task='{task}' not found. Tried dirs: {_candidate_dataset_dirs(ext_data_dir)}"
+    )
+
+
+def _resolve_prompt_config_file():
+    candidates = [
+        os.path.join(os.getcwd(), "accuracy", "o1", "config", "dataset2prompt.json"),
+        os.path.join(os.getcwd(), "accuracy", "LongBench", "config", "dataset2prompt.json"),
+        r"D:\code\FreeKV\accuracy\eval\reasoning\config\dataset2prompt.json",
+        "/home/zlab/licw/code/FreeKV/accuracy/eval/reasoning/config/dataset2prompt.json",
+    ]
+    for path in candidates:
+        if os.path.exists(path):
+            return path
+    raise FileNotFoundError(f"dataset2prompt.json not found. Tried: {candidates}")
+
+
 # This is the customized building prompt for chat models
-def load_data(data_dir, method, task, qid=None):
-    data_path = os.path.join(os.getcwd(), data_dir)
-    if method == "o1":
-        data = []
-        file_name = f"{task}.jsonl"
-        with open(os.path.join(data_path, file_name), 'r', encoding='utf-8') as f:
+def load_data(task, qid=None, ext_data_dir=None):
+    ds_path = _resolve_dataset_file(task, ext_data_dir=ext_data_dir)
+    data = []
+    if ds_path.endswith(".jsonl"):
+        with open(ds_path, "r", encoding="utf-8") as f:
             for line in f:
-                example = json.loads(line)
-                data.append(example)
-    elif method == "longbench":
-        file_name = f"{task}.json"
-        with open(os.path.join(data_path, file_name), 'r', encoding='utf-8') as f:
-            data = json.load(f)
+                line = line.strip()
+                if line:
+                    data.append(json.loads(line))
+    else:
+        with open(ds_path, "r", encoding="utf-8") as f:
+            payload = json.load(f)
+        if isinstance(payload, list):
+            data = payload
+        elif isinstance(payload, dict) and isinstance(payload.get("data"), list):
+            data = payload["data"]
+        else:
+            raise ValueError(f"Unsupported JSON dataset format: {ds_path}")
     if qid is not None:
         data = data[qid:qid+1]
-    return data
+    return data, ds_path
 
 def get_pred(
     model,
@@ -74,7 +137,18 @@ def get_pred(
         pbar.set_description(
             f"Generating for dataset {dataset}, seed {seed}, q_idx {idx+1}"
         )
-        prompt = prompt_format.format(**json_obj)
+        if prompt_format is None:
+            prompt = json_obj.get("prompt", "")
+            if not prompt:
+                # Fallback for longgenbench-like examples without a dedicated prompt field.
+                prompt_parts = []
+                for key in ("instruction", "context", "input", "question", "query", "document", "passage"):
+                    v = json_obj.get(key)
+                    if isinstance(v, str) and v.strip():
+                        prompt_parts.append(v.strip())
+                prompt = "\n\n".join(prompt_parts) if prompt_parts else str(json_obj)
+        else:
+            prompt = prompt_format.format(**json_obj)
         tokenizer_prompt = tokenizer(
             prompt, truncation=False, return_tensors="pt"
         ).input_ids[0]
@@ -110,7 +184,7 @@ def get_pred(
             {
                 "input": prompt,
                 "pred": pred,
-                "answer": json_obj["answer"],
+                "answer": json_obj.get("answer", json_obj.get("answers", "")),
                 "gen_len":len(output[context_length:]),
             }
         )   
@@ -195,16 +269,30 @@ if __name__ == "__main__":
         model2path[model_name], model_name, device
     )
     max_length = model2maxlen[model_name]
-    ds_dir = "accuracy/o1/datasets"
+    data, data_path = load_data(dataset, args.data_idx, ext_data_dir=args.ext_data_dir)
+    print(f"dataset path: {data_path}")
 
-    data = load_data(ds_dir, "o1", dataset, args.data_idx)
-
-    # we design specific prompt format and max generation length for each task, feel free to modify them to optimize model output
-    dataset2prompt = json.load(open("accuracy/config/dataset2prompt.json", "r"))
-
-    prompt_format = dataset2prompt[dataset.upper()]
-    if "cot" in model_name:
-        prompt_format += "<Thought> {thought} </Thought>\n"
+    # Task-specific prompt handling:
+    # - gov_report: fixed summarization prompt template
+    # - lgbench/longgenbench: use sample['prompt'] directly
+    # - otherwise: keep original o1 prompt config behavior
+    dataset_l = dataset.lower()
+    if dataset_l == "gov_report":
+        prompt_format = (
+            "You are given a report by a government agency. "
+            "Write a one-page summary of the report.\n\n"
+            "Report:\n{context}\n\n"
+            "Now, write a one-page summary of the report.\n\nSummary:"
+        )
+    elif dataset_l in {"lgbench", "longgenbench"}:
+        prompt_format = None
+    else:
+        prompt_cfg = _resolve_prompt_config_file()
+        dataset2prompt = json.load(open(prompt_cfg, "r"))
+        print(f"prompt config path: {prompt_cfg}")
+        prompt_format = dataset2prompt[dataset.upper()]
+        if "cot" in model_name:
+            prompt_format += "<Thought> {thought} </Thought>\n"
     
     res_dir = os.path.join("accuracy", "o1", "results")
     if args.data_idx:

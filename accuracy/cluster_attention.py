@@ -1041,6 +1041,28 @@ def cluster_reset(model):
         module.clustered_decode_tokens = 0
         if os.getenv("GET_ATTN") or os.getenv("GET_TOPK"):
             module.attn_weight = None
+
+
+def _infer_case_name(args):
+    # Support both accuracy scripts (--task) and external scripts (--dataset).
+    for key in ("case", "task", "dataset"):
+        value = getattr(args, key, None)
+        if isinstance(value, str) and value:
+            return value.lower()
+    return None
+
+
+def _apply_case_preset(module, args):
+    case_name = _infer_case_name(args)
+    module.case_name = case_name
+    # FreeKV long-input/long-generation cases:
+    # - gov_report
+    # - longgenbench (alias: lgbench)
+    # These cases run in no-window mode, i.e.
+    # selected tokens = sink + mid_select + decode_gen_token.
+    if case_name in {"gov_report", "lgbench", "longgenbench"}:
+        module.local_window = 0
+        module.window = 0
              
 def apply_cluster_config(module, args):
     nlist = args.nlist
@@ -1057,6 +1079,7 @@ def apply_cluster_config(module, args):
     module.mode = args.mode
     if args.window is not None:
         module.window = args.window
+    _apply_case_preset(module, args)
     if args.balance:
         module.cluster_params = ivf_flat.IndexParams(
         n_lists=nlist, metric='inner_product', kmeans_n_iters=args.fit_iter,
