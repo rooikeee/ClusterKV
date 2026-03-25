@@ -43,12 +43,12 @@ class QuestAttention(nn.Module):
             self.rotary_emb = LlamaRotaryEmbedding(self.head_dim, max_position_embeddings=self.max_position_embeddings)
             self.rope_scale = 1.0
         else:
-            scaling_type = self.config.rope_scaling["type"]
-            if scaling_type == "linear":
-                # support for Longchat-v1.5.
-                self.rope_scale = self.config.rope_scaling["factor"]
+            rope_scaling = self.config.rope_scaling
+            if isinstance(rope_scaling, dict):
+                # Compatible with both {"type": ...} and {"rope_type": ...} formats.
+                self.rope_scale = float(rope_scaling.get("factor", 1.0))
             else:
-                raise ValueError(f"Unknown RoPE scaling type {scaling_type}")
+                self.rope_scale = float(rope_scaling)
 
     def _shape(self, tensor: torch.Tensor, seq_len: int, bsz: int):
         return tensor.view(bsz, seq_len, self.num_heads, self.head_dim).transpose(1, 2).contiguous()
@@ -98,7 +98,7 @@ class QuestAttention(nn.Module):
         torch.cuda.nvtx.range_push("RoPE")
         clusterkv.utils.apply_rope_in_place(
             query_states, key_states, iController.kv_cache.seqlen - q_len, 
-            rope_scale=self.config.rope_scaling, 
+            rope_scale=self.rope_scale, 
             rope_theta=self.config.rope_theta, 
         )
         torch.cuda.nvtx.range_pop()
