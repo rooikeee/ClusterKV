@@ -146,7 +146,7 @@ class ClusterKVController:
 		if seq_len > 1:
 			self.prompt_len = seq_len
 			self.win_indices += self.prompt_len
-		elif self.generated_len > self.window and self.generated_len % self.window == 1:
+		elif self.window > 0 and self.generated_len > self.window and self.generated_len % self.window == 1:
 			self.win_indices += self.window
 	
 	@property
@@ -155,7 +155,7 @@ class ClusterKVController:
 
 	@property
 	def cur_win_size(self):
-		if self.generated_len == 0:
+		if self.generated_len == 0 or self.window <= 0:
 			return 0
 		return (self.generated_len % self.window) or self.window
 

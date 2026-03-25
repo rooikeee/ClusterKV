@@ -95,6 +95,30 @@ def load_longgenbench_records(path: str) -> List[dict]:
     raise ValueError(f"Unsupported LongGenBench file format: {path}")
 
 
+def load_json_records(path: str) -> List[dict]:
+    if not path or not os.path.exists(path):
+        raise FileNotFoundError(f"Dataset path not found: {path}")
+    if path.endswith(".jsonl"):
+        records = []
+        with open(path, "r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                records.append(json.loads(line))
+        return records
+    with open(path, "r", encoding="utf-8") as f:
+        payload = json.load(f)
+    if isinstance(payload, list):
+        return payload
+    if isinstance(payload, dict):
+        if "data" in payload and isinstance(payload["data"], list):
+            return payload["data"]
+        if "examples" in payload and isinstance(payload["examples"], list):
+            return payload["examples"]
+    raise ValueError(f"Unsupported dataset format: {path}")
+
+
 def build_longgenbench_prompt(example: dict, prompt_key: str = "prompt") -> str:
     if prompt_key in example and isinstance(example[prompt_key], str):
         return example[prompt_key]
@@ -134,8 +158,21 @@ def load_prompts(tokenizer, args) -> List[str]:
             prompts.append(truncate_in_middle(tokenizer, prompt, args.context_len))
             if len(prompts) >= args.num_prompts:
                 break
+    elif args.bench_dataset == "gov_report":
+        records = load_json_records(args.gov_report_path)
+        prompt_format = (
+            "You are given a report by a government agency. "
+            "Write a one-page summary of the report.\n\n"
+            "Report:\n{context}\n\n"
+            "Now, write a one-page summary of the report.\n\nSummary:"
+        )
+        for example in records:
+            prompt = prompt_format.format(**example)
+            prompts.append(truncate_in_middle(tokenizer, prompt, args.context_len))
+            if len(prompts) >= args.num_prompts:
+                break
     else:
-        records = load_longgenbench_records(args.longgenbench_path)
+        records = load_json_records(args.longgenbench_path)
         for example in records:
             prompt = build_longgenbench_prompt(example, prompt_key=args.longgen_prompt_key)
             prompts.append(truncate_in_middle(tokenizer, prompt, args.context_len))
@@ -183,16 +220,31 @@ def benchmark_clusterkv():
     )
     parser.add_argument(
         "--bench_dataset",
-        choices=["longbench", "longgenbench"],
+        choices=["longbench", "longgenbench", "lgbench", "gov_report"],
         default="longbench",
         help="Benchmark prompt source.",
     )
     parser.add_argument("--longbench_task", type=str, default="triviaqa", help="LongBench subset name.")
-    parser.add_argument("--longgenbench_path", type=str, default="", help="Path to LongGenBench json/jsonl file.")
+    parser.add_argument(
+        "--longgenbench_path",
+        type=str,
+        default=os.path.join("efficiency", "datasets", "longgenbench.json"),
+        help="Path to LongGenBench json/jsonl file.",
+    )
+    parser.add_argument(
+        "--gov_report_path",
+        type=str,
+        default=os.path.join("efficiency", "datasets", "gov_report.jsonl"),
+        help="Path to gov_report json/jsonl file.",
+    )
     parser.add_argument("--longgen_prompt_key", type=str, default="prompt", help="Prompt field in LongGenBench.")
     parser.add_argument("--num_prompts", type=int, default=256, help="How many samples to scan from dataset.")
     args = parser.parse_args()
     assert args.warmup < args.iteration, "Warmup iterations must be less than total iterations"
+
+    # Alias kept for compatibility with FreeKV naming.
+    if args.bench_dataset == "lgbench":
+        args.bench_dataset = "longgenbench"
 
     assert args.model in MODEL_CFGS, f"Model {args.model} not found in MODEL_CFGS"
     model_cfg = MODEL_CFGS[args.model]
