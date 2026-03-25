@@ -311,6 +311,7 @@ def benchmark_clusterkv():
 
     prefill_latency = []
     decode_latency = []
+    decode_steps_per_iter = []
 
     for _ in tqdm(range(args.iteration)):
         torch.cuda.empty_cache()
@@ -335,14 +336,17 @@ def benchmark_clusterkv():
             generated_ids[b_idx].append(pred_token_idx[b_idx].item())
 
         # Decode stage.
+        step_count = 0
         for _ in range(args.decode_len):
             ts = time.perf_counter()
             output = model(input_ids=pred_token_idx)
             te = time.perf_counter()
             decode_latency.append(te - ts)
+            step_count += 1
             pred_token_idx = output.logits[:, -1, :].argmax(dim=-1).unsqueeze(-1)
             for b_idx in range(args.batch_size):
                 generated_ids[b_idx].append(pred_token_idx[b_idx].item())
+        decode_steps_per_iter.append(step_count)
 
         # print first sample decode as sanity-check
         sample_pred = tokenizer.decode(generated_ids[0], skip_special_tokens=True)
@@ -355,12 +359,22 @@ def benchmark_clusterkv():
 
     warmup = args.warmup
     avg_prefill_latency = np.mean(prefill_latency[warmup:])
-    avg_decode_latency = np.mean(decode_latency[warmup * args.decode_len :])
+    decode_latency_post_warmup = decode_latency[warmup * args.decode_len :]
+    avg_decode_latency = np.mean(decode_latency_post_warmup) if decode_latency_post_warmup else 0.0
+    avg_decode_steps = np.mean(decode_steps_per_iter[warmup:]) if decode_steps_per_iter[warmup:] else 0.0
+    # If generated decode length is shorter than target decode_len,
+    # normalize decode time with single-token latency * target decode_len.
+    norm_decode_total_latency = avg_decode_latency * args.decode_len
+    raw_decode_total_latency = avg_decode_latency * avg_decode_steps
+    norm_total_latency = avg_prefill_latency + norm_decode_total_latency
+    raw_total_latency = avg_prefill_latency + raw_decode_total_latency
 
-    print("batch_size,token_budget,context_len,decode_len,avg_prefill_latency,avg_decode_latency")
+    print("batch_size,token_budget,context_len,target_decode_len,avg_prefill_latency,avg_decode_latency_per_token,raw_decode_total_latency,norm_decode_total_latency,raw_total_latency,norm_total_latency")
     print(
         f"{args.batch_size},{token_budget},{args.context_len},{args.decode_len},"
-        f"{avg_prefill_latency},{avg_decode_latency}"
+        f"{avg_prefill_latency},{avg_decode_latency},"
+        f"{raw_decode_total_latency},{norm_decode_total_latency},"
+        f"{raw_total_latency},{norm_total_latency}"
     )
 
 
