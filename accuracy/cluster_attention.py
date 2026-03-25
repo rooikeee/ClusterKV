@@ -302,8 +302,15 @@ def cluster_attn_out(query_states, key_states, value_states, attention_mask, pro
     include_decode_generated_tokens = prompt_len > token_budget
     sink = min(sink, kv_seq_len)
     local_window = max(local_window, 0)
-    local_end = kv_seq_len if include_decode_generated_tokens else min(prompt_len, kv_seq_len)
-    local_start = max(sink, local_end - local_window) if local_window > 0 else local_end
+    if include_decode_generated_tokens:
+        # Long-context decode: no local window concept.
+        # Keep all generated tokens so selected KV becomes:
+        # sink + mid_select + decode_gen_token
+        local_start = min(prompt_len, kv_seq_len)
+        local_end = kv_seq_len
+    else:
+        local_end = min(prompt_len, kv_seq_len)
+        local_start = max(sink, local_end - local_window) if local_window > 0 else local_end
     cluster_budget = max(token_budget - sink, 0)
 
     has_cluster_tokens = (
@@ -665,12 +672,18 @@ def forward_cluster(
     sink = self.long_decode_sink
     local_window = self.local_window
 
+    cached_kv_len = 0
+    if past_key_value is not None:
+        layer_cache = past_key_value[self.layer_id]
+        if layer_cache is not None and layer_cache[0] is not None:
+            cached_kv_len = layer_cache[0].shape[-2]
+    current_kv_len = cached_kv_len + q_len
+
     current_layer = self.layer_idx
     num_layers = self.config.num_hidden_layers
     is_heavy_layer = (current_layer == 0) or (current_layer == num_layers - 1)
     if is_heavy_layer or q_len > 1 \
-        or (self.prompt_len == 0 and q_len < self.token_budget) \
-        or (self.prompt_len > 0 and self.prompt_len+q_len < self.token_budget):
+        or current_kv_len < self.token_budget:
         if q_len > 1:
             self.prompt_len = q_len
             self.clustered_decode_tokens = 0
@@ -859,9 +872,13 @@ def forward_cluster_glm(
     bsz, q_len, _ = hidden_states.size()
     assert bsz == 1
 
+    cached_kv_len = 0
+    if kv_cache is not None:
+        cached_kv_len = kv_cache[0].shape[-2]
+    current_kv_len = cached_kv_len + q_len
+
     if q_len > 1 or self.layer_number < 3 \
-        or (self.prompt_len == 0 and q_len < self.token_budget) \
-        or (self.prompt_len > 0 and self.prompt_len+q_len < self.token_budget) :   # for first several tokens of ppl_eval
+        or current_kv_len < self.token_budget:
         if q_len > 1:
             self.prompt_len = q_len
             if self.cache_steps > 0 and self.layer_number>= 2:
