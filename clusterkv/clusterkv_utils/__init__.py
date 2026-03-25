@@ -48,11 +48,12 @@ def append_kv(
         #     print(controller.kv_indices_with_last_offload, controller.kv_indptr_for_append_offload,
         #             controller.kv_last_page_idx_offload)
         if controller.should_offload_layer(layer_idx):
-            token_budget = controller._token_budget
+            token_budget = controller.get_effective_offload_budget()
             sink = controller.sink
+            prefill_keep_tokens = min(seq_len, sink + token_budget)
             _kernels.append_kv_cache_prefill(
-                k[:sink + token_budget, ...].repeat_interleave(controller.num_key_value_groups, dim=1),
-                v[:sink + token_budget, ...].repeat_interleave(controller.num_key_value_groups, dim=1),
+                k[:prefill_keep_tokens, ...].repeat_interleave(controller.num_key_value_groups, dim=1),
+                v[:prefill_keep_tokens, ...].repeat_interleave(controller.num_key_value_groups, dim=1),
                 controller.kv_cache[layer_idx],
                 controller.kv_indices_with_last_offload,
                 controller.kv_indptr_for_append_offload,
@@ -77,7 +78,6 @@ def append_kv(
         #     print(controller.kv_indices_with_last_offload, controller.kv_indptr_for_append_offload,
         #           controller.kv_last_page_idx_offload)
         if controller.should_offload_layer(layer_idx):
-            token_budget = controller._token_budget
             _kernels.append_kv_cache_decode(
                 k.repeat_interleave(controller.num_key_value_groups, dim=1),
                 v.repeat_interleave(controller.num_key_value_groups, dim=1),

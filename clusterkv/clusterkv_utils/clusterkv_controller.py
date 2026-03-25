@@ -128,6 +128,8 @@ class ClusterKVController:
 			(num_heads, nlist), dtype=torch.int32, device=device)
 
 		self._token_budget = token_budget
+		self._base_token_budget = token_budget
+		self._offload_max_cache_tokens = sink + token_budget + window
 		self.infer_token_budget = None
 		self._max_page_limit = 1024*1024 # arbitraty large size
 
@@ -137,6 +139,7 @@ class ClusterKVController:
 		self.last_page_len = 1
 
 		self._decode_handler = BatchDecodeWithPagedKVCacheWrapper(kv_layout="NHD")
+		self._decode_handler_started = False
 
 		self.overlap_build = True
 		self.build_cluster_stream = None
@@ -170,18 +173,26 @@ class ClusterKVController:
 		return self.win_indices[:, :self.cur_win_size]
 
 	def kv_cache_mid(self, layer_idx):
-		return self.kv_cache[layer_idx][self.sink: self.sink+self._token_budget-1, :, 0, ...]
+		budget = self.get_effective_offload_budget() if self.offload else self._token_budget
+		return self.kv_cache[layer_idx][self.sink: self.sink+budget-1, :, 0, ...]
 
 	def begin_forward(self, seq_len: int, updateTensor: bool = True):
 		torch.cuda.nvtx.range_push("begin_forward")
+		offload_seqlen = None
 		if updateTensor:
 			self.kv_indptr_for_append = torch.tensor([0, self.kv_seqlen], 
 													dtype=torch.int32, device=self.device)
 			self.kv_last_page_idx = self.kv_seqlen - 1
 			self.kv_indices_with_last = self.all_kv_indices[:self.kv_seqlen]
 		if self.offload:
-			offload_seqlen = self.sink + self._token_budget + self.cur_win_size
-			# print(offload_seqlen, self._token_budget, self.generated_len)
+			offload_budget = self.get_effective_offload_budget()
+			offload_seqlen = self.sink + offload_budget + self.cur_win_size
+			offload_seqlen = min(
+				offload_seqlen,
+				self.kv_seqlen,
+				self.max_seq_len,
+				self._offload_max_cache_tokens,
+			)
 			self.kv_indptr_for_append_offload = torch.tensor([0, offload_seqlen], 
 													dtype=torch.int32, device=self.device)
 			self.kv_indices_with_last_offload = self.all_kv_indices[:offload_seqlen]
@@ -191,9 +202,15 @@ class ClusterKVController:
 			pass
 		else:
 			# decode requests
-			self.infer_token_budget = min(self.sink + self._token_budget, self.kv_seqlen)
-			cur_win_size = 0 if self._token_budget > self.kv_seqlen else self.cur_win_size	# full or no offload
-			self.kv_indptr_for_approx_decode = torch.tensor([0, self.infer_token_budget + cur_win_size], 
+			decode_budget = self._token_budget
+			if self.offload and self.offload_all_layers:
+				decode_budget = self.get_effective_offload_budget()
+			self.infer_token_budget = min(self.sink + decode_budget, self.kv_seqlen)
+			cur_win_size = 0 if decode_budget > self.kv_seqlen else self.cur_win_size	# full or no offload
+			approx_decode_len = self.infer_token_budget + cur_win_size
+			if self.offload and self.offload_all_layers and offload_seqlen is not None:
+				approx_decode_len = min(approx_decode_len, offload_seqlen)
+			self.kv_indptr_for_approx_decode = torch.tensor([0, approx_decode_len], 
 															dtype=torch.int32, device=self.device)
 			if self.offload and self.offload_all_layers:
 				num_kv_heads_for_decode = self.num_kv_heads_
@@ -207,10 +224,13 @@ class ClusterKVController:
 				1,
 				self.dtype
 			)
+			self._decode_handler_started = True
 		torch.cuda.nvtx.range_pop()
 		
 	def end_forward(self):
-		self._decode_handler.end_forward()
+		if self._decode_handler_started:
+			self._decode_handler.end_forward()
+			self._decode_handler_started = False
 	
 	def get_k(self, layer_idx) -> torch.Tensor:
 		return self.kv_cache[layer_idx][:self.kv_seqlen, 0, ...]
@@ -253,6 +273,10 @@ class ClusterKVController:
 
 	def should_offload_layer(self, layer_idx: int) -> bool:
 		return self.offload and (self.offload_all_layers or layer_idx >= 2)
+
+	def get_effective_offload_budget(self) -> int:
+		# Offload metadata buffers are sized by init-time token_budget.
+		return min(self._token_budget, self._base_token_budget)
 
 	def clean_states(self):
 		self.prompt_len = 0

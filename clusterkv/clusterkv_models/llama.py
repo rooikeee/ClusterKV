@@ -443,7 +443,10 @@ class LlamaModel(LlamaPreTrainedModel):
         # Skip layers by setting infinite budgets
         if self._skip_layer > 0:
             for c in active_controllers:
-                c.set_token_budget(c._max_page_limit)
+                if c.offload_all_layers:
+                    c.set_token_budget(self._token_budget)
+                else:
+                    c.set_token_budget(c._max_page_limit)
                 c.begin_forward(seq_length)
 
         for idx, decoder_layer in enumerate(self.layers):
