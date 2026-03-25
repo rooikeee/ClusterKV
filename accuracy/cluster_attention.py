@@ -673,8 +673,13 @@ def forward_cluster(
     local_window = self.local_window
 
     cached_kv_len = 0
+    layer_cache = None
     if past_key_value is not None:
-        layer_cache = past_key_value[self.layer_id]
+        try:
+            if len(past_key_value) > self.layer_id:
+                layer_cache = past_key_value[self.layer_id]
+        except (TypeError, KeyError, IndexError):
+            layer_cache = None
         if layer_cache is not None and layer_cache[0] is not None:
             cached_kv_len = layer_cache[0].shape[-2]
     current_kv_len = cached_kv_len + q_len
@@ -700,8 +705,18 @@ def forward_cluster(
             **kwargs,
         )
 
-    prefill_key = past_key_value[self.layer_id][0]
-    prefill_value = past_key_value[self.layer_id][1]
+    if layer_cache is None:
+        return self.flash_forward(
+            hidden_states,
+            position_embeddings,
+            attention_mask,
+            past_key_value,
+            cache_position,
+            **kwargs,
+        )
+
+    prefill_key = layer_cache[0]
+    prefill_value = layer_cache[1]
     if prefill_key.shape[-2] <= sink:
         return self.flash_forward(
             hidden_states,
