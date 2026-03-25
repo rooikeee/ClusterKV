@@ -54,44 +54,15 @@ class ClusterKVAttention(nn.Module):
     def _shape(self, tensor: torch.Tensor, seq_len: int, bsz: int):
         return tensor.view(bsz, seq_len, self.num_heads, self.head_dim).transpose(1, 2).contiguous()
 
-    def forward(
+    def _forward_single(
         self,
-        hidden_states: torch.Tensor,
-        attention_mask: Optional[torch.Tensor] = None,
-        position_ids: Optional[torch.LongTensor] = None,
-        past_key_value: Optional[Tuple[torch.Tensor]] = None,
-        output_attentions: bool = False,
-        use_cache: bool = False,
-        controller: Optional[ClusterKVController] = None,
-    ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[Tuple[torch.Tensor]]]:
-        bsz, q_len, _ = hidden_states.size()
-
-        assert bsz == 1, "ClusterKVAttention only supports batch size 1."
-        assert hasattr(self, 'layer_idx'), "ClusterKVAttention requires layer_idx to inference."
-
-        if self.pretraining_tp > 1:
-            assert False and "should not happen"
-        else:
-            torch.cuda.nvtx.range_push("qkv_proj")
-            query_states = self.q_proj(hidden_states)
-            key_states = self.k_proj(hidden_states)
-            value_states = self.v_proj(hidden_states)
-            torch.cuda.nvtx.range_pop()
-        
-        # Not transposed for Append kv cache NHD layout
-        query_states = query_states.view(q_len, self.num_heads, self.head_dim)
-        key_states = key_states.view(q_len, self.num_key_value_heads, self.head_dim)
-        value_states = value_states.view(q_len, self.num_key_value_heads, self.head_dim)
-
-        torch.cuda.nvtx.range_push("RoPE")
-        # -q_len as kv_seqlen has been increased in prepare_metadata
-        clusterkv.utils.apply_rope_in_place(
-            query_states, key_states, controller.kv_seqlen - q_len, 
-            rope_scale=self.config.rope_scaling, 
-            rope_theta=self.config.rope_theta, 
-        )
-        torch.cuda.nvtx.range_pop()
-
+        query_states: torch.Tensor,
+        key_states: torch.Tensor,
+        value_states: torch.Tensor,
+        q_len: int,
+        controller: ClusterKVController,
+        shared_sel_token_indices: Optional[torch.Tensor] = None,
+    ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
         if self.layer_idx >= 2 and not controller.full:
             if q_len > 1:
                 # build clusters during prefill
@@ -99,14 +70,22 @@ class ClusterKVAttention(nn.Module):
                 if controller.overlap_build:
                     with torch.cuda.stream(controller.build_cluster_stream):
                         build_cluster(
-                            controller, self.layer_idx, key_states[controller.sink:], 0,
-                            controller.nlist, controller.build_cluster_stream
+                            controller,
+                            self.layer_idx,
+                            key_states[controller.sink:],
+                            0,
+                            controller.nlist,
+                            controller.build_cluster_stream,
                         )
                         controller.build_cluster_events[self.layer_idx].record(controller.build_cluster_stream)
                 else:
                     build_cluster(
-                        controller, self.layer_idx, key_states[controller.sink:], 0,
-                        controller.nlist, torch.cuda.default_stream()
+                        controller,
+                        self.layer_idx,
+                        key_states[controller.sink:],
+                        0,
+                        controller.nlist,
+                        torch.cuda.default_stream(),
                     )
 
         torch.cuda.nvtx.range_push("append_kv")
@@ -119,18 +98,21 @@ class ClusterKVAttention(nn.Module):
         torch.cuda.nvtx.range_pop()
 
         if self.layer_idx >= 2 and not controller.full:
-            if q_len == 1 and controller.generated_len % controller.window == 0:
+            if controller.window > 0 and q_len == 1 and controller.generated_len % controller.window == 0:
                 # appending clustering during decoding
                 append_key_for_cluster = controller.get_app_k_clustering(self.layer_idx)
                 build_cluster(
-                    controller, self.layer_idx, append_key_for_cluster, 
+                    controller,
+                    self.layer_idx,
+                    append_key_for_cluster,
                     controller.kv_seqlen - controller.sink - controller.window,
-                    controller.window_nlist, torch.cuda.default_stream()
+                    controller.window_nlist,
+                    torch.cuda.default_stream(),
                 )
                 if self.layer_idx >= 2 and controller.offload:
                     controller.offload_window_kv(self.layer_idx)
 
-        # Prefill/Decode kernels is different
+        # Prefill/Decode kernels are different.
         if q_len > 1:
             torch.cuda.nvtx.range_push("prefill_attn")
             if controller.offload:
@@ -139,7 +121,7 @@ class ClusterKVAttention(nn.Module):
                     controller,
                     self.layer_idx,
                     key_states=key_states,
-                    value_states=value_states
+                    value_states=value_states,
                 )
             else:
                 attn_output = prefill_forward(
@@ -150,42 +132,123 @@ class ClusterKVAttention(nn.Module):
             torch.cuda.nvtx.range_pop()
             if self.layer_idx >= 2 and controller.offload:
                 controller.offload_prefill_kv(self.layer_idx, key_states, value_states)
-        else:
-            # Skipping layers is controled by PAGE_BUDGET, which is set in LlamaModel.
-            if not controller.need_estimate():
-                torch.cuda.nvtx.range_push("full_attn")
-                attn_output = decode_sparse_attn(
-                    query_states,
-                    controller,
-                    self.layer_idx,
-                    None
-                )
-                torch.cuda.nvtx.range_pop()
-            else:
-                # sel = True
-                # if sel:
-                torch.cuda.nvtx.range_push("indexing")
-                if not controller.build_cluster_finish[self.layer_idx]:
-                    controller.build_cluster_events[self.layer_idx].wait(controller.build_cluster_stream)
-                    controller.build_cluster_finish[self.layer_idx] = True
-                update_sel_indices(
-                    query_states,
-                    controller,
-                    self.layer_idx,
-                )
-                torch.cuda.nvtx.range_pop()
-                torch.cuda.nvtx.range_push("approx_attn")
-                attn_output = decode_sparse_attn(
-                    query_states,
-                    controller,
-                    self.layer_idx,
-                    controller.sel_token_indices
-                )
-                torch.cuda.nvtx.range_pop()
+            return attn_output, None
 
-        attn_output = attn_output.unsqueeze(0) # unsqueeze the batch dimension
+        # Decode stage.
+        if not controller.need_estimate():
+            torch.cuda.nvtx.range_push("full_attn")
+            attn_output = decode_sparse_attn(
+                query_states,
+                controller,
+                self.layer_idx,
+                None,
+            )
+            torch.cuda.nvtx.range_pop()
+            return attn_output, None
+
+        torch.cuda.nvtx.range_push("indexing")
+        if not controller.build_cluster_finish[self.layer_idx]:
+            controller.build_cluster_events[self.layer_idx].wait(controller.build_cluster_stream)
+            controller.build_cluster_finish[self.layer_idx] = True
+        if shared_sel_token_indices is None:
+            update_sel_indices(
+                query_states,
+                controller,
+                self.layer_idx,
+            )
+            shared_sel_token_indices = controller.sel_token_indices
+        torch.cuda.nvtx.range_pop()
+
+        torch.cuda.nvtx.range_push("approx_attn")
+        attn_output = decode_sparse_attn(
+            query_states,
+            controller,
+            self.layer_idx,
+            shared_sel_token_indices,
+        )
+        torch.cuda.nvtx.range_pop()
+        return attn_output, shared_sel_token_indices
+
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        attention_mask: Optional[torch.Tensor] = None,
+        position_ids: Optional[torch.LongTensor] = None,
+        past_key_value: Optional[Tuple[torch.Tensor]] = None,
+        output_attentions: bool = False,
+        use_cache: bool = False,
+        controller: Optional[ClusterKVController] = None,
+    ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[Tuple[torch.Tensor]]]:
+        bsz, q_len, _ = hidden_states.size()
+
+        assert hasattr(self, 'layer_idx'), "ClusterKVAttention requires layer_idx to inference."
+        if controller is None:
+            raise ValueError("ClusterKVAttention requires a valid controller.")
+
+        if isinstance(controller, (list, tuple)):
+            controllers = list(controller)
+        else:
+            controllers = [controller]
+        if bsz > 1 and len(controllers) != bsz:
+            raise ValueError(
+                f"Batch size is {bsz}, but got {len(controllers)} controller(s). "
+                "Please call clusterkv_init(batch_size=...) for batched inference."
+            )
+        if bsz == 1 and len(controllers) != 1:
+            raise ValueError(f"Batch size is 1, but got {len(controllers)} controllers.")
+
+        if self.pretraining_tp > 1:
+            assert False and "should not happen"
+        else:
+            torch.cuda.nvtx.range_push("qkv_proj")
+            query_states = self.q_proj(hidden_states)
+            key_states = self.k_proj(hidden_states)
+            value_states = self.v_proj(hidden_states)
+            torch.cuda.nvtx.range_pop()
+        
+        # Keep NHD layout for Append/KM kernels.
+        query_states = query_states.view(bsz, q_len, self.num_heads, self.head_dim)
+        key_states = key_states.view(bsz, q_len, self.num_key_value_heads, self.head_dim)
+        value_states = value_states.view(bsz, q_len, self.num_key_value_heads, self.head_dim)
+
+        attn_output_per_batch = []
+        shared_sel_token_indices = None
+        for b_idx in range(bsz):
+            current_controller = controllers[b_idx]
+            single_q = query_states[b_idx]
+            single_k = key_states[b_idx]
+            single_v = value_states[b_idx]
+
+            torch.cuda.nvtx.range_push("RoPE")
+            # -q_len as kv_seqlen has been increased in prepare_metadata
+            clusterkv.utils.apply_rope_in_place(
+                single_q,
+                single_k,
+                current_controller.kv_seqlen - q_len,
+                rope_scale=self.config.rope_scaling,
+                rope_theta=self.config.rope_theta,
+            )
+            torch.cuda.nvtx.range_pop()
+
+            # Reuse batch-0 selected indices for all batches in decode sparse stage.
+            # This follows "same cluster selection across batch" requirement.
+            shared_for_this = shared_sel_token_indices if (b_idx > 0 and q_len == 1) else None
+            single_output, sel_token_indices = self._forward_single(
+                single_q,
+                single_k,
+                single_v,
+                q_len,
+                current_controller,
+                shared_sel_token_indices=shared_for_this,
+            )
+            if b_idx == 0 and sel_token_indices is not None:
+                shared_sel_token_indices = sel_token_indices
+
+            attn_output_per_batch.append(single_output)
+
+        attn_output = torch.stack(attn_output_per_batch, dim=0)
         # FlashInfer output is naturally NHD
-        # Note that we manully control NHD. Should be more general
+        # Note that we manually control NHD. Should be more general.
         if attn_output.size() != (bsz, q_len, self.num_heads, self.head_dim):
             raise ValueError(
                 f"`attn_output` should be of size {(bsz, q_len, self.num_heads, self.head_dim)}, but is"
@@ -202,7 +265,6 @@ class ClusterKVAttention(nn.Module):
             attn_output = self.o_proj(attn_output)
         torch.cuda.nvtx.range_pop()
 
-        if not output_attentions:
-            attn_weights = None
+        attn_weights = None
 
         return attn_output, attn_weights, past_key_value

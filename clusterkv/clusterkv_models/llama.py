@@ -308,6 +308,7 @@ class LlamaModel(LlamaPreTrainedModel):
         self.gradient_checkpointing = False
         
         self.controller: ClusterKVController = None
+        self.controllers: Optional[List[ClusterKVController]] = None
         
         # Initialize weights and apply final processing
         self.post_init()
@@ -418,24 +419,41 @@ class LlamaModel(LlamaPreTrainedModel):
         all_self_attns = () if output_attentions else None
         next_decoder_cache = () if use_cache else None
 
-        # Configure Quest Controller
-        # Prepare indices/indptr for newly appended tokens
-        assert self.controller is not None, "Please init Controller first."
-        self.controller.prepare_metadata(seq_length)
+        # Configure ClusterKV controller(s).
+        # Prepare indices/indptr for newly appended tokens.
+        if self.controllers is not None:
+            if len(self.controllers) != batch_size:
+                raise ValueError(
+                    f"Batch size is {batch_size}, but got {len(self.controllers)} controllers. "
+                    "Please re-init with clusterkv_init(batch_size=...)."
+                )
+            active_controllers = self.controllers
+        else:
+            assert self.controller is not None, "Please init Controller first."
+            if batch_size != 1:
+                raise ValueError(
+                    "Batch inference requires one controller per sample. "
+                    "Please call clusterkv_init(batch_size=...) before running batched inference."
+                )
+            active_controllers = [self.controller]
+
+        for c in active_controllers:
+            c.prepare_metadata(seq_length)
 
         # Skip layers by setting infinite budgets
         if self._skip_layer > 0:
-            self.controller.set_token_budget(self.controller._max_page_limit)
-            self.controller.begin_forward(seq_length)
+            for c in active_controllers:
+                c.set_token_budget(c._max_page_limit)
+                c.begin_forward(seq_length)
 
         for idx, decoder_layer in enumerate(self.layers):
             # Configure regular skipping layers
             if idx == self._skip_layer:
-                self.controller.end_forward()
-                self.controller.set_token_budget(self._token_budget)
-                # Avoid the redundant init/copy of metadata
-                # if previous skip layer does, then skip it again
-                self.controller.begin_forward(seq_length, updateTensor=(idx==0))
+                for c in active_controllers:
+                    c.end_forward()
+                    c.set_token_budget(self._token_budget)
+                    # Avoid redundant init/copy of metadata if previous skip layer already did.
+                    c.begin_forward(seq_length, updateTensor=(idx==0))
 
             if output_hidden_states:
                 all_hidden_states += (hidden_states,)
@@ -455,7 +473,7 @@ class LlamaModel(LlamaPreTrainedModel):
                     past_key_value=past_key_value,
                     output_attentions=output_attentions,
                     use_cache=use_cache,
-                    controller=self.controller,
+                    controller=active_controllers if batch_size > 1 else active_controllers[0],
                 )
                 torch.cuda.nvtx.range_pop()
 
@@ -467,8 +485,9 @@ class LlamaModel(LlamaPreTrainedModel):
             if output_attentions:
                 all_self_attns += (layer_outputs[1],)
         
-        # Configure Quest Controller
-        self.controller.end_forward()
+        # Configure ClusterKV controller(s)
+        for c in active_controllers:
+            c.end_forward()
 
         torch.cuda.nvtx.range_push("lastnorm")
         hidden_states = self.norm(hidden_states)
@@ -514,47 +533,62 @@ class LlamaForCausalLM(LlamaPreTrainedModel):
         sink = 16,
         window = 320,
         window_nlist = 8,
-        offload = False
+        offload = False,
+        batch_size: int = 1,
     ):
         """
-        Init function for Quest. Must be called before forwarding.
+        Init function for ClusterKV. Must be called before forwarding.
         This function allocates all GPU memory for max_seq_len KV-Cache.
         """
-        assert self.model.controller is None, "Can't init Quest Controller twice."
+        assert self.model.controller is None and self.model.controllers is None, "Can't init ClusterKV Controller twice."
         
         config = self._config
         self.model._nlist = nlist
         self.model._token_budget = token_budget
         self.model._skip_layer = 2
-        
-        self.model.controller = ClusterKVController(
-            num_layers=config.num_hidden_layers,
-            num_heads=config.num_attention_heads,
-            num_kv_heads=config.num_key_value_heads,
-            head_dim=config.hidden_size // config.num_attention_heads,
-            nlist=nlist,
-            niter=niter,
-            token_budget=token_budget,
-            max_seq_len=max_seq_len, # Used for allocating KV Pools
-            dtype=dtype,
-            device=device,
-            full=full,
-            sink=sink,
-            window=window,
-            window_nlist=window_nlist,
-            offload=offload
-        )
+
+        def build_single_controller() -> ClusterKVController:
+            return ClusterKVController(
+                num_layers=config.num_hidden_layers,
+                num_heads=config.num_attention_heads,
+                num_kv_heads=config.num_key_value_heads,
+                head_dim=config.hidden_size // config.num_attention_heads,
+                nlist=nlist,
+                niter=niter,
+                token_budget=token_budget,
+                max_seq_len=max_seq_len, # Used for allocating KV Pools
+                dtype=dtype,
+                device=device,
+                full=full,
+                sink=sink,
+                window=window,
+                window_nlist=window_nlist,
+                offload=offload,
+            )
+
+        if batch_size <= 1:
+            self.model.controller = build_single_controller()
+            self.model.controllers = None
+        else:
+            self.model.controllers = [build_single_controller() for _ in range(batch_size)]
+            # Keep the first controller as a compatibility alias for existing call sites.
+            self.model.controller = self.model.controllers[0]
         
         print(f"ClusterKV allocates KV-Cache of {max_seq_len} tokens")
         print(f"Token budget is set to {token_budget}")
+        print(f"Batch size is set to {batch_size}")
     
     def clusterkv_clear(self):
         """
         Assistant function for cleaning states of KV-Cache,
         which prepares for a new conversation.
         """
-        assert self.model.controller is not None, "Must be called after init."
-        self.model.controller.clean_states()
+        assert self.model.controller is not None or self.model.controllers is not None, "Must be called after init."
+        if self.model.controllers is not None:
+            for c in self.model.controllers:
+                c.clean_states()
+        else:
+            self.model.controller.clean_states()
 
     def get_input_embeddings(self):
         return self.model.embed_tokens

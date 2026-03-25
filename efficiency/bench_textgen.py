@@ -3,38 +3,36 @@
 
 import argparse
 import dataclasses
+import json
+import os
 import time
+from typing import List
+
 import numpy as np
 import torch
-from tqdm.auto import tqdm
-
 from datasets import load_dataset
+from tqdm.auto import tqdm
 from transformers import AutoTokenizer
 
-# from quest import LlamaForCausalLM
 from clusterkv.quest_models.llama import LlamaForCausalLM as QuestLlamaForCausalLM
 from clusterkv.clusterkv_models.llama import LlamaForCausalLM as ClusterKVLlamaForCausalLM
-import os
 
 c = torch.cuda.get_device_capability()
 os.environ["TORCH_CUDA_ARCH_LIST"] = f"{c[0]}.{c[1]}"
 
+
 @dataclasses.dataclass
 class ModelConfig:
-  model_path: str
-  dtype: str = dataclasses.field(default="float16")
-  device: str = dataclasses.field(default="cuda:0")
+    model_path: str
+    dtype: str = dataclasses.field(default="float16")
+    device: str = dataclasses.field(default="cuda:0")
+
 
 MODEL_CFGS = {
-    "llama2-7b":
-        ModelConfig(
-            model_path="meta-llama/Llama-2-7b-chat-hf"
-        ),
-    "llama3-8b":
-        ModelConfig(
-            model_path="meta-llama/Meta-Llama-3-8B-Instruct"
-        ),
+    "llama2-7b": ModelConfig(model_path="meta-llama/Llama-2-7b-chat-hf"),
+    "llama3-8b": ModelConfig(model_path="meta-llama/Meta-Llama-3-8B-Instruct"),
 }
+
 
 def load_model(model_cfg: ModelConfig, method: str):
     device = torch.device(model_cfg.device)
@@ -45,32 +43,154 @@ def load_model(model_cfg: ModelConfig, method: str):
     with device:
         if method == "quest":
             model = QuestLlamaForCausalLM.from_pretrained(
-                model_cfg.model_path, device_map=device, torch_dtype=dtype,
+                model_cfg.model_path,
+                device_map=device,
+                torch_dtype=dtype,
             )
         elif method in ["clusterkv", "full"]:
             model = ClusterKVLlamaForCausalLM.from_pretrained(
-                model_cfg.model_path, device_map=device, torch_dtype=dtype,
+                model_cfg.model_path,
+                device_map=device,
+                torch_dtype=dtype,
             )
+        else:
+            raise ValueError(f"Unsupported method: {method}")
+    model.eval()
     return model, tokenizer
 
+
+def truncate_in_middle(tokenizer, prompt: str, max_tokens: int) -> str:
+    tokenized_prompt = tokenizer(prompt, truncation=False, return_tensors="pt").input_ids[0]
+    if len(tokenized_prompt) <= max_tokens:
+        return prompt
+    half = max_tokens // 2
+    return tokenizer.decode(tokenized_prompt[:half], skip_special_tokens=True) + tokenizer.decode(
+        tokenized_prompt[-half:], skip_special_tokens=True
+    )
+
+
+def load_longgenbench_records(path: str) -> List[dict]:
+    if not path or not os.path.exists(path):
+        raise FileNotFoundError(f"LongGenBench path not found: {path}")
+
+    if path.endswith(".jsonl"):
+        records = []
+        with open(path, "r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                records.append(json.loads(line))
+        return records
+
+    with open(path, "r", encoding="utf-8") as f:
+        payload = json.load(f)
+    if isinstance(payload, list):
+        return payload
+    if isinstance(payload, dict):
+        if "data" in payload and isinstance(payload["data"], list):
+            return payload["data"]
+        if "examples" in payload and isinstance(payload["examples"], list):
+            return payload["examples"]
+    raise ValueError(f"Unsupported LongGenBench file format: {path}")
+
+
+def build_longgenbench_prompt(example: dict, prompt_key: str = "prompt") -> str:
+    if prompt_key in example and isinstance(example[prompt_key], str):
+        return example[prompt_key]
+
+    preferred_keys = [
+        "instruction",
+        "context",
+        "input",
+        "question",
+        "query",
+        "document",
+        "passage",
+    ]
+    chunks = []
+    for key in preferred_keys:
+        value = example.get(key, None)
+        if value is None:
+            continue
+        if isinstance(value, str) and value.strip():
+            chunks.append(value.strip())
+    if chunks:
+        return "\n\n".join(chunks)
+    return json.dumps(example, ensure_ascii=False)
+
+
+def load_prompts(tokenizer, args) -> List[str]:
+    prompts: List[str] = []
+    if args.bench_dataset == "longbench":
+        data = load_dataset("THUDM/LongBench", args.longbench_task, split="test")
+        prompt_format = (
+            "Answer the question based on the given passage. "
+            "Only give me the answer and do not output any other words. "
+            "The following are some examples.\n\n{context}\n\n{input}"
+        )
+        for example in data:
+            prompt = prompt_format.format(**example)
+            prompts.append(truncate_in_middle(tokenizer, prompt, args.context_len))
+            if len(prompts) >= args.num_prompts:
+                break
+    else:
+        records = load_longgenbench_records(args.longgenbench_path)
+        for example in records:
+            prompt = build_longgenbench_prompt(example, prompt_key=args.longgen_prompt_key)
+            prompts.append(truncate_in_middle(tokenizer, prompt, args.context_len))
+            if len(prompts) >= args.num_prompts:
+                break
+
+    if not prompts:
+        raise RuntimeError("No valid prompts were loaded.")
+    return prompts
+
+
+def build_batch_prompts(prompts: List[str], batch_size: int, batch_mode: str) -> List[str]:
+    if batch_mode == "same":
+        return [prompts[0]] * batch_size
+    if len(prompts) < batch_size:
+        repeats = (batch_size + len(prompts) - 1) // len(prompts)
+        prompts = (prompts * repeats)[:batch_size]
+        return prompts
+    return prompts[:batch_size]
+
+
 @torch.inference_mode()
-def benchmark_quest():
+def benchmark_clusterkv():
     parser = argparse.ArgumentParser()
     parser.add_argument("--model", choices=MODEL_CFGS.keys(), default="llama3-8b")
-    parser.add_argument("--context_len", type=int, default=4*1024, help="Prefill length")
+    parser.add_argument("--context_len", type=int, default=4 * 1024, help="Prefill length")
     parser.add_argument("--decode_len", type=int, default=256, help="Generation length")
     parser.add_argument("--page_size", type=int, default=16, help="Page size for Quest")
     parser.add_argument("--token_budget", type=int, default=512, help="Token budget for ClusterKV and Quest")
     parser.add_argument("--iteration", type=int, default=3, help="Number of iterations")
     parser.add_argument("--warmup", type=int, default=0, help="Warmup iterations")
-    parser.add_argument("--method", type=str, 
-                        choices=['quest', 'clusterkv', 'full'], required=True)
+    parser.add_argument("--method", type=str, choices=["quest", "clusterkv", "full"], required=True)
     parser.add_argument("--nlist", type=int, default=200, help="Number of clusters")
     parser.add_argument("--niter", type=int, default=20, help="Number of max cluster iterations")
     parser.add_argument("--sink", type=int, default=16, help="Sink size")
     parser.add_argument("--window", type=int, default=320, help="Window size")
     parser.add_argument("--window_nlist", type=int, default=8, help="Number of clusters in a window")
     parser.add_argument("--offload", action="store_true", help="Offloading cache to CPU")
+    parser.add_argument("--batch_size", type=int, default=1, help="Batch size for batched inference")
+    parser.add_argument(
+        "--batch_mode",
+        choices=["same", "distinct"],
+        default="same",
+        help="same: duplicate one prompt across batch; distinct: use different prompts.",
+    )
+    parser.add_argument(
+        "--bench_dataset",
+        choices=["longbench", "longgenbench"],
+        default="longbench",
+        help="Benchmark prompt source.",
+    )
+    parser.add_argument("--longbench_task", type=str, default="triviaqa", help="LongBench subset name.")
+    parser.add_argument("--longgenbench_path", type=str, default="", help="Path to LongGenBench json/jsonl file.")
+    parser.add_argument("--longgen_prompt_key", type=str, default="prompt", help="Prompt field in LongGenBench.")
+    parser.add_argument("--num_prompts", type=int, default=256, help="How many samples to scan from dataset.")
     args = parser.parse_args()
     assert args.warmup < args.iteration, "Warmup iterations must be less than total iterations"
 
@@ -79,109 +199,104 @@ def benchmark_quest():
 
     if args.offload:
         assert args.method == "clusterkv", "Offloading is only supported for clusterkv"
-    
+    if args.method == "quest" and args.batch_size > 1:
+        raise ValueError("Quest path currently supports batch_size=1 only.")
+
     max_seq_len = args.context_len + args.decode_len + 512
-    page_size = args.page_size
     method = args.method
-    token_budget = 102400 if "full" in method else args.token_budget
-    context_len = args.context_len
-    decode_len = args.decode_len
-    nlist = args.nlist
-    niter = args.niter
+    token_budget = 102400 if method == "full" else args.token_budget
 
     model, tokenizer = load_model(model_cfg, method)
-    
+
     dtype = getattr(torch, model_cfg.dtype)
     device = torch.device(model_cfg.device)
     if method == "quest":
         model.quest_init(
-            page_size=page_size,
-            max_seq_len=max_seq_len,
-            token_budget=token_budget,
-            dtype=dtype,
-            device=device
-        )
-    elif method in ["clusterkv", "full"]:
-        model.clusterkv_init(
-            nlist=nlist,
-            niter=niter,
+            page_size=args.page_size,
             max_seq_len=max_seq_len,
             token_budget=token_budget,
             dtype=dtype,
             device=device,
-            full=(method=="full"),
+        )
+    elif method in ["clusterkv", "full"]:
+        model.clusterkv_init(
+            nlist=args.nlist,
+            niter=args.niter,
+            max_seq_len=max_seq_len,
+            token_budget=token_budget,
+            dtype=dtype,
+            device=device,
+            full=(method == "full"),
             sink=args.sink,
             window=args.window,
             window_nlist=args.window_nlist,
-            offload=True if args.offload else False
+            offload=True if args.offload else False,
+            batch_size=args.batch_size,
         )
 
-    hidden_size = model._config.hidden_size
+    prompts = load_prompts(tokenizer, args)
+    batch_prompts = build_batch_prompts(prompts, args.batch_size, args.batch_mode)
+    print("=" * 100)
+    print(f"method={method}, dataset={args.bench_dataset}, batch_size={args.batch_size}, batch_mode={args.batch_mode}")
+    print(f"context_len={args.context_len}, decode_len={args.decode_len}, token_budget={token_budget}")
+    print(f"example prompt chars={len(batch_prompts[0])}")
 
     prefill_latency = []
     decode_latency = []
-    data = load_dataset('THUDM/LongBench', "triviaqa", split='test')
-    json_obj = data[1]
-    prompt_format = "Answer the question based on the given passage. Only give me the answer and do not output any other words. The following are some examples.\n\n{context}\n\n{input}" 
-    prompt = prompt_format.format(**json_obj)
-    tokenized_prompt = tokenizer(
-        prompt, truncation=False, return_tensors="pt"
-    ).input_ids[0]
-    if len(tokenized_prompt) > context_len:
-        half = int(context_len / 2)
-        prompt = tokenizer.decode(
-            tokenized_prompt[:half], skip_special_tokens=True
-        ) + tokenizer.decode(tokenized_prompt[-half:], skip_special_tokens=True)
-    # print(prompt)
-    print("="*100)
-    input = tokenizer(prompt, truncation=False, return_tensors="pt").to("cuda")
-    input_ids = input.input_ids
 
-    generated_content = []
     for _ in tqdm(range(args.iteration)):
-        # clear cuda cache
         torch.cuda.empty_cache()
 
-        # Prefill Stage
-        # hidden_states = torch.randn(1, context_len, hidden_size, dtype=dtype, device=device)
+        batch_input = tokenizer(batch_prompts, truncation=False, padding=True, return_tensors="pt").to(device)
+        input_ids = batch_input.input_ids
+        attention_mask = batch_input.attention_mask
+
+        generated_ids: List[List[int]] = [[] for _ in range(args.batch_size)]
+
+        # Prefill stage.
         ts = time.perf_counter()
         output = model(
-            # inputs_embeds=hidden_states,
-            input_ids=input_ids
+            input_ids=input_ids,
+            attention_mask=attention_mask,
         )
         te = time.perf_counter()
         prefill_latency.append(te - ts)
-        pred_token_idx = output.logits[:, -1, :].argmax(dim=-1).unsqueeze(-1)
-        generated_content += [pred_token_idx.item()]
 
-        # Start decoding decode_len tokens
-        # hidden_states = torch.randn(1, 1, hidden_size, dtype=dtype, device=device)
-        for _ in range(decode_len):
+        pred_token_idx = output.logits[:, -1, :].argmax(dim=-1).unsqueeze(-1)
+        for b_idx in range(args.batch_size):
+            generated_ids[b_idx].append(pred_token_idx[b_idx].item())
+
+        # Decode stage.
+        for _ in range(args.decode_len):
             ts = time.perf_counter()
-            output = model(
-                # inputs_embeds=hidden_states,
-                input_ids=pred_token_idx,
-            )
+            output = model(input_ids=pred_token_idx)
             te = time.perf_counter()
             decode_latency.append(te - ts)
             pred_token_idx = output.logits[:, -1, :].argmax(dim=-1).unsqueeze(-1)
-            generated_content += [pred_token_idx.item()]
-        
-        pred = tokenizer.decode(generated_content, skip_special_tokens=True)
-        print(pred)
+            for b_idx in range(args.batch_size):
+                generated_ids[b_idx].append(pred_token_idx[b_idx].item())
+
+        # print first sample decode as sanity-check
+        sample_pred = tokenizer.decode(generated_ids[0], skip_special_tokens=True)
+        print(sample_pred)
+
         if method == "quest":
             model.quest_clear()
         elif method in ["clusterkv", "full"]:
             model.clusterkv_clear()
-    
+
     warmup = args.warmup
     avg_prefill_latency = np.mean(prefill_latency[warmup:])
-    avg_decode_latency = np.mean(decode_latency[warmup*decode_len:])
+    avg_decode_latency = np.mean(decode_latency[warmup * args.decode_len :])
 
-    print("page_size,token_budget,context_len,decode_len,avg_prefill_latency,avg_decode_latency")
-    print(f"{page_size},{token_budget},{context_len},{decode_len},{avg_prefill_latency},{avg_decode_latency}")
+    print("batch_size,token_budget,context_len,decode_len,avg_prefill_latency,avg_decode_latency")
+    print(
+        f"{args.batch_size},{token_budget},{args.context_len},{args.decode_len},"
+        f"{avg_prefill_latency},{avg_decode_latency}"
+    )
 
-def seed_everything(seed):
+
+def seed_everything(seed: int):
     torch.manual_seed(seed)
     torch.cuda.manual_seed(seed)
     np.random.seed(seed)
@@ -189,6 +304,7 @@ def seed_everything(seed):
     torch.backends.cudnn.deterministic = True
     torch.cuda.manual_seed_all(seed)
 
+
 if __name__ == "__main__":
     seed_everything(42)
-    benchmark_quest()
+    benchmark_clusterkv()
