@@ -534,6 +534,7 @@ class LlamaForCausalLM(LlamaPreTrainedModel):
         window = 320,
         window_nlist = 8,
         offload = False,
+        offload_all_layers = False,
         batch_size: int = 1,
     ):
         """
@@ -564,6 +565,7 @@ class LlamaForCausalLM(LlamaPreTrainedModel):
                 window=window,
                 window_nlist=window_nlist,
                 offload=offload,
+                offload_all_layers=offload_all_layers,
             )
 
         if batch_size <= 1:

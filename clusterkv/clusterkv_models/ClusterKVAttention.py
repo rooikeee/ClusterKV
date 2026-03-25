@@ -109,7 +109,7 @@ class ClusterKVAttention(nn.Module):
                     controller.window_nlist,
                     torch.cuda.default_stream(),
                 )
-                if self.layer_idx >= 2 and controller.offload:
+                if controller.should_offload_layer(self.layer_idx):
                     controller.offload_window_kv(self.layer_idx)
 
         # Prefill/Decode kernels are different.
@@ -130,7 +130,7 @@ class ClusterKVAttention(nn.Module):
                     self.layer_idx,
                 )
             torch.cuda.nvtx.range_pop()
-            if self.layer_idx >= 2 and controller.offload:
+            if controller.should_offload_layer(self.layer_idx):
                 controller.offload_prefill_kv(self.layer_idx, key_states, value_states)
             return attn_output, None
 

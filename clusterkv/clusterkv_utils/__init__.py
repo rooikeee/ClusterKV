@@ -47,7 +47,7 @@ def append_kv(
         #             controller.kv_last_page_idx)
         #     print(controller.kv_indices_with_last_offload, controller.kv_indptr_for_append_offload,
         #             controller.kv_last_page_idx_offload)
-        if controller.offload and layer_idx >= 2:
+        if controller.should_offload_layer(layer_idx):
             token_budget = controller._token_budget
             sink = controller.sink
             _kernels.append_kv_cache_prefill(
@@ -76,7 +76,7 @@ def append_kv(
         #     print("Decode append", layer_idx)
         #     print(controller.kv_indices_with_last_offload, controller.kv_indptr_for_append_offload,
         #           controller.kv_last_page_idx_offload)
-        if controller.offload and layer_idx >= 2:
+        if controller.should_offload_layer(layer_idx):
             token_budget = controller._token_budget
             _kernels.append_kv_cache_decode(
                 k.repeat_interleave(controller.num_key_value_groups, dim=1),
@@ -229,37 +229,38 @@ def decode_sparse_attn(
     #     assert torch.all(topk_indices >= 0)
     #     assert torch.all(topk_indices < controller.kv_seqlen)
 
-    if controller.offload and layer_idx >= 2:
+    if controller.should_offload_layer(layer_idx):
         # recall_impl = "naive"
         recall_impl = ""
-        if recall_impl == "naive":
-            num_heads, budget = topk_indices.shape 
-            # [K, 1, num_heads, 1]
-            topk_indices = topk_indices.transpose(0, 1).unsqueeze(1).unsqueeze(3)
-            # [K, 2, num_heads, head_dim]
-            topk_indices = topk_indices.expand(budget, 2, num_heads, controller.head_dim)
-            controller.default_stream.wait_event(controller.offload_events[layer_idx])
-            cpu_select_kv = torch.gather(
-                controller.kv_cache_cpu[layer_idx].repeat_interleave(controller.num_key_value_groups, dim=-2), 
-                0, topk_indices.to("cpu").to(torch.int64))
-            kv_cache_mid = controller.kv_cache_mid(layer_idx)
-            kv_cache_mid.copy_(cpu_select_kv)
-        else:
-            _kernels.recall(
-                controller.kv_cache_mid(layer_idx),
-                controller.kv_cache_cpu[layer_idx],
-                topk_indices,
-                controller.g2c[layer_idx],
-                controller.c2g,
-                controller.is_in_cache,
-                controller.is_in_topk,
-                controller.swap_out_indices,
-                controller.swap_in_indices,
-                controller.swap_out_count,
-                controller.swap_in_count,
-                controller.kv_seqlen,
-            )
-            # assert(torch.all(controller.swap_out_count == controller.swap_in_count))
+        if topk_indices is not None:
+            if recall_impl == "naive":
+                num_heads, budget = topk_indices.shape 
+                # [K, 1, num_heads, 1]
+                topk_indices = topk_indices.transpose(0, 1).unsqueeze(1).unsqueeze(3)
+                # [K, 2, num_heads, head_dim]
+                topk_indices = topk_indices.expand(budget, 2, num_heads, controller.head_dim)
+                controller.default_stream.wait_event(controller.offload_events[layer_idx])
+                cpu_select_kv = torch.gather(
+                    controller.kv_cache_cpu[layer_idx].repeat_interleave(controller.num_key_value_groups, dim=-2), 
+                    0, topk_indices.to("cpu").to(torch.int64))
+                kv_cache_mid = controller.kv_cache_mid(layer_idx)
+                kv_cache_mid.copy_(cpu_select_kv)
+            else:
+                _kernels.recall(
+                    controller.kv_cache_mid(layer_idx),
+                    controller.kv_cache_cpu[layer_idx],
+                    topk_indices,
+                    controller.g2c[layer_idx],
+                    controller.c2g,
+                    controller.is_in_cache,
+                    controller.is_in_topk,
+                    controller.swap_out_indices,
+                    controller.swap_in_indices,
+                    controller.swap_out_count,
+                    controller.swap_in_count,
+                    controller.kv_seqlen,
+                )
+                # assert(torch.all(controller.swap_out_count == controller.swap_in_count))
 
         controller._decode_handler.forward(
             q,

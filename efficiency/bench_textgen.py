@@ -227,6 +227,11 @@ def benchmark_clusterkv():
     parser.add_argument("--window", type=int, default=320, help="Window size")
     parser.add_argument("--window_nlist", type=int, default=8, help="Number of clusters in a window")
     parser.add_argument("--offload", action="store_true", help="Offloading cache to CPU")
+    parser.add_argument(
+        "--cpu_kv_all",
+        action="store_true",
+        help="Force all-layer KV offload to CPU (enables --offload automatically).",
+    )
     parser.add_argument("--batch_size", type=int, default=1, help="Batch size for batched inference")
     parser.add_argument(
         "--batch_mode",
@@ -267,6 +272,10 @@ def benchmark_clusterkv():
 
     if args.offload:
         assert args.method == "clusterkv", "Offloading is only supported for clusterkv"
+    if args.cpu_kv_all:
+        if args.method != "clusterkv":
+            raise ValueError("--cpu_kv_all is only supported for clusterkv")
+        args.offload = True
     if args.method == "quest" and args.batch_size > 1:
         raise ValueError("Quest path currently supports batch_size=1 only.")
 
@@ -299,6 +308,7 @@ def benchmark_clusterkv():
             window=args.window,
             window_nlist=args.window_nlist,
             offload=True if args.offload else False,
+            offload_all_layers=True if args.cpu_kv_all else False,
             batch_size=args.batch_size,
         )
 
@@ -307,6 +317,7 @@ def benchmark_clusterkv():
     print("=" * 100)
     print(f"method={method}, dataset={args.bench_dataset}, batch_size={args.batch_size}, batch_mode={args.batch_mode}")
     print(f"context_len={args.context_len}, decode_len={args.decode_len}, token_budget={token_budget}")
+    print(f"offload={args.offload}, cpu_kv_all={args.cpu_kv_all}")
     print(f"example prompt chars={len(batch_prompts[0])}")
 
     prefill_latency = []

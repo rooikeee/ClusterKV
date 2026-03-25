@@ -22,7 +22,8 @@ class ClusterKVController:
 		sink,
 		window,
 		window_nlist,
-		offload
+		offload,
+		offload_all_layers=False
 	):
 		self.full = full
 		# page_size = 1
@@ -38,14 +39,16 @@ class ClusterKVController:
 
 		self.max_seq_len = max_seq_len
 		self.kv_cache: List[torch.Tensor] = [None] * num_layers
-		for i in range(2):
-			self.kv_cache[i] = torch.empty((max_seq_len, 2, 1, num_kv_heads, head_dim),
-											dtype=dtype, device=device)
+		self.offload_all_layers = bool(offload_all_layers)
+		for i in range(num_layers):
+			layer_offload = offload and (self.offload_all_layers or i >= 2)
+			layer_num_kv_heads = num_heads if layer_offload else num_kv_heads
+			layer_kv_cache_size = (sink + token_budget + window) if layer_offload else max_seq_len
+			self.kv_cache[i] = torch.empty(
+				(layer_kv_cache_size, 2, 1, layer_num_kv_heads, head_dim),
+				dtype=dtype, device=device
+			)
 		self.num_kv_heads_ = num_heads if offload else num_kv_heads
-		kv_cache_size = max_seq_len if not offload else sink + token_budget + window
-		for i in range(num_layers - 2):
-			self.kv_cache[2+i] = torch.empty((kv_cache_size, 2, 1, self.num_kv_heads_, head_dim),
-											dtype=dtype, device=device)
 		
 		# ==================================== Offload related ====================================
 		self.default_stream = torch.cuda.default_stream()
@@ -63,16 +66,19 @@ class ClusterKVController:
 		self.swap_in_count: Optional[torch.Tensor] = None
 		assert not (offload and full), "offload cannot be enabled for full kv"
 		if offload:
-			for i in range(num_layers - 2):
-				self.kv_cache_cpu[2+i] = torch.empty((max_seq_len, 2, num_kv_heads, head_dim),
-												dtype=dtype, device="cpu", pin_memory=True)
+			for i in range(num_layers):
+				layer_offload = self.should_offload_layer(i)
+				if not layer_offload:
+					continue
+				self.kv_cache_cpu[i] = torch.empty((max_seq_len, 2, num_kv_heads, head_dim),
+											dtype=dtype, device="cpu", pin_memory=True)
 				# init index after prefill, the g do not include sink
 				t_range = torch.arange(0, token_budget-1, dtype=torch.int32, device=device).repeat(num_heads, 1)
-				self.g2c[2+i] = torch.full(
+				self.g2c[i] = torch.full(
 					(num_heads, token_budget-1), -1, dtype=torch.int32, device=device
 				)
-				self.g2c[2+i].copy_(t_range)
-				self.g2c[2+i] += sink
+				self.g2c[i].copy_(t_range)
+				self.g2c[i] += sink
 			self.offload_stream = torch.cuda.Stream(device)
 			self.offload_events = [torch.cuda.Event() for _ in range(num_layers)]
 
@@ -189,10 +195,14 @@ class ClusterKVController:
 			cur_win_size = 0 if self._token_budget > self.kv_seqlen else self.cur_win_size	# full or no offload
 			self.kv_indptr_for_approx_decode = torch.tensor([0, self.infer_token_budget + cur_win_size], 
 															dtype=torch.int32, device=self.device)
+			if self.offload and self.offload_all_layers:
+				num_kv_heads_for_decode = self.num_kv_heads_
+			else:
+				num_kv_heads_for_decode = self.num_kv_heads if updateTensor else self.num_kv_heads_
 			self._decode_handler.begin_forward(
 				self.kv_indptr_for_approx_decode,
 				self.num_heads,
-				self.num_kv_heads if updateTensor else self.num_kv_heads_,
+				num_kv_heads_for_decode,
 				self.head_dim,
 				1,
 				self.dtype
@@ -210,7 +220,7 @@ class ClusterKVController:
 				self.kv_cache[layer_idx][:self.kv_seqlen, 1, ...]
 
 	def get_app_k_clustering(self, layer_idx) -> torch.Tensor:
-		if self.offload:
+		if self.should_offload_layer(layer_idx):
 			return self.kv_cache[layer_idx][-self.window:, 0, 0, self.kv_head_slice, :]
 		else:
 			return self.kv_cache[layer_idx][self.kv_seqlen-self.window: self.kv_seqlen, 0, 0, ...]
@@ -240,6 +250,9 @@ class ClusterKVController:
 		if self.infer_token_budget is None:
 			return False
 		return self.kv_seqlen > self.infer_token_budget
+
+	def should_offload_layer(self, layer_idx: int) -> bool:
+		return self.offload and (self.offload_all_layers or layer_idx >= 2)
 
 	def clean_states(self):
 		self.prompt_len = 0
