@@ -135,7 +135,24 @@ class ClusterKVAttention(nn.Module):
             return attn_output, None
 
         # Decode stage.
-        if not controller.need_estimate():
+        if (not controller.need_estimate()) or (self.layer_idx < 2):
+            torch.cuda.nvtx.range_push("full_attn")
+            attn_output = decode_sparse_attn(
+                query_states,
+                controller,
+                self.layer_idx,
+                None,
+            )
+            torch.cuda.nvtx.range_pop()
+            return attn_output, None
+
+        has_cluster_metadata = (
+            controller.centroids[self.layer_idx] is not None
+            and controller.cluster_size[self.layer_idx] is not None
+            and controller.cluster_size_ps[self.layer_idx] is not None
+            and controller.cluster_key_indices[self.layer_idx] is not None
+        )
+        if not has_cluster_metadata:
             torch.cuda.nvtx.range_push("full_attn")
             attn_output = decode_sparse_attn(
                 query_states,
@@ -147,8 +164,10 @@ class ClusterKVAttention(nn.Module):
             return attn_output, None
 
         torch.cuda.nvtx.range_push("indexing")
-        if not controller.build_cluster_finish[self.layer_idx]:
-            controller.build_cluster_events[self.layer_idx].wait(controller.build_cluster_stream)
+        if controller.overlap_build and (not controller.build_cluster_finish[self.layer_idx]):
+            torch.cuda.current_stream(device=query_states.device).wait_event(
+                controller.build_cluster_events[self.layer_idx]
+            )
             controller.build_cluster_finish[self.layer_idx] = True
         if shared_sel_token_indices is None:
             update_sel_indices(
