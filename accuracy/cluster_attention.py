@@ -377,8 +377,9 @@ def cluster_attn_out(query_states, key_states, value_states, attention_mask, pro
             sel_key_indices = sel_key_indices[:, :cluster_budget]
         else:
             sel_key_indices = []
-            for h in range(num_heads):
-                kv_h = h // num_key_value_groups
+            meta_heads = num_kv_heads if gqa_policy else num_heads
+            for h in range(meta_heads):
+                kv_h = h if gqa_policy else h // num_key_value_groups
                 head_num_need_clusters = num_need_clusters[h]
                 head_sel_key_indices = []
                 for i in range(head_num_need_clusters):
