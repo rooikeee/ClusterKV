@@ -1,0 +1,29 @@
+[
+    {
+        "prompt": "Sophia is a biologist with a passion for chronicling his vibrant life through weekly diary entries. Captures:\n1) Family member birthday: husband (yourself) (birthday on May 13), my wife (birthday on September 19), my child_1 (birthday on September 06), my father (birthday on July 27), my mother (birthday on June 05), \n2) Attending a fashion week in Paris in week 24-25.\n\n3) Attend a parenting workshop every 5 weeks on weekends, starting from week 13.\n 4) Weekly updates on weather changes, work developments, family life, and other interesting topics.\n5) Use '#*#' to separate each weekly entry (e.g. #*# Week 1 (January 1st - January 7th): \nThe New Year dawned frosty and bright, with temperatures stubbornly clinging to a cool 5\u00b0C. The cold didn't deter us from our annual New Year's walk through the nearby park, a tradition that helps us set our intentions for the year ahead. Wrapped in our warmest coats, my wife and I discussed our personal and professional goals for 2018, making plans to nurture both our careers and our family. Back at work this week, the atmosphere in the engineering lab was charged with fresh energy and enthusiasm. The new projects on the horizon promise challenging and innovative solutions that could redefine our approaches. I spent the first few days sketching out the initial phases of a new design that could potentially improve energy efficiency in urban buildings. At home, the post-holiday transition was smooth. We spent the evenings savoring the quiet after the festive buzz, gradually taking down the Christmas decorations. However, we decided to keep some twinkling lights around the living room; their soft glow brings a cozy cheer to the long winter nights. This week also marked the return to school for the kids. They shared stories of their holiday adventures with friends, buzzing with excitement and a bit of holiday hangover. As for the weekend, it brought a gentle snowfall that transformed our neighborhood into a serene winter landscape, perfect for some impromptu snowball fights and hot chocolate by the fireplace. Overall, the week was a blend of reflection, planning, and familial warmth, setting a hopeful tone for the new year)\nGenerate a complete weekly diary for Sophia for the entire year of 2018. Start from January 1st, a Monday, marking the first week, and continue through to December 31st, the end of the 52nd week. Ensure that the diary consists of 52 entries, one for each week. Each diary entry should be at least 200 words. When the design of all 52 weeks is complete, use '*** finished ***' to indicate the end of the document. Ensure clarity and continuity without any interruptions or omissions in the narrative throughout the year. *** started ***\n#*# Week 1 (January 1st - January 7th):",
+        "checks_once": {
+            "19": "husband (yourself) birthday",
+            "38": "my wife birthday",
+            "36": "my child_1 birthday",
+            "30": "my father birthday",
+            "23": "my mother birthday"
+        },
+        "checks_range": {
+            "24": "Attending a fashion week in Paris",
+            "25": "Attending a fashion week in Paris"
+        },
+        "checks_periodic": {
+            "13": "Attend a parenting workshop",
+            "18": "Attend a parenting workshop",
+            "23": "Attend a parenting workshop",
+            "28": "Attend a parenting workshop",
+            "33": "Attend a parenting workshop",
+            "38": "Attend a parenting workshop",
+            "43": "Attend a parenting workshop",
+            "48": "Attend a parenting workshop"
+        },
+        "type": "Week",
+        "prefix": "#*# Week 1 (January 1st - January 7th):",
+        "number": 52
+    }
+]
