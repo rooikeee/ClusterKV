@@ -299,19 +299,25 @@ def cluster_attn_out(query_states, key_states, value_states, attention_mask, pro
     _, num_heads, q_len, _ = query_states.shape
     hidden_size = num_heads * head_dim
 
-    include_decode_generated_tokens = prompt_len > token_budget
     sink = min(sink, kv_seq_len)
     local_window = max(local_window, 0)
-    if include_decode_generated_tokens:
-        # Long-context decode: no local window concept.
-        # Keep all generated tokens so selected KV becomes:
-        # sink + mid_select + decode_gen_token
+    use_window = local_window > 0
+    if use_window:
+        # Reasoning-style decode: keep a sliding local window from current KV tail.
+        local_end = kv_seq_len
+        local_start = max(sink, local_end - local_window)
+    else:
+        # LongBench-style decode: no window, keep all generated tokens.
         local_start = min(prompt_len, kv_seq_len)
         local_end = kv_seq_len
+
+    reserved_local = max(local_end - local_start, 0) if use_window else 0
+    if use_window:
+        # Token composition: sink + mid_select + local_window
+        cluster_budget = max(token_budget - sink - reserved_local, 0)
     else:
-        local_end = min(prompt_len, kv_seq_len)
-        local_start = max(sink, local_end - local_window) if local_window > 0 else local_end
-    cluster_budget = max(token_budget - sink, 0)
+        # Token composition: sink + mid_select + decode_gen_token
+        cluster_budget = max(token_budget - sink, 0)
 
     has_cluster_tokens = (
         key_centroids is not None
@@ -412,7 +418,7 @@ def cluster_attn_out(query_states, key_states, value_states, attention_mask, pro
 
     res_attn_weight = None
     if os.getenv("GET_ATTN") and not os.getenv("NORMAL_ATTN"):
-        res_attn_weight = torch.zeros((1, num_heads, 1, prompt_len), dtype=torch.int32, device=key_states.device)
+        res_attn_weight = torch.zeros((1, num_heads, 1, kv_seq_len), dtype=torch.int32, device=key_states.device)
         if sel_key_indices.shape[-1] > 0 and sel_key_indices.shape[1] == num_heads:
             res_attn_weight = res_attn_weight.scatter_(dim=-1, index=sel_key_indices.unsqueeze(2), value=1.0)
 
@@ -554,22 +560,22 @@ def build_decode_cluster_params(cluster_params, balance, nlist):
 def maybe_append_decode_clusters(self, key_states, value_states, sink):
     update_interval = getattr(self, "cluster_update_interval", 320)
     append_nlist = getattr(self, "cluster_update_nlist", 4)
+    local_window = max(getattr(self, "local_window", getattr(self, "window", 0) or 0), 0)
     if update_interval <= 0 or append_nlist <= 0:
         return
-    # Only keep decode-generated tokens when prompt is longer than token budget.
-    if self.prompt_len <= self.token_budget:
+    # In no-window mode, only long prompt needs decode cluster append.
+    # In window mode, reasoning tasks also need decode tokens clustered.
+    if local_window <= 0 and self.prompt_len <= self.token_budget:
         return
 
     generated_len = key_states.shape[-2] - self.prompt_len
-    if generated_len <= 0 or generated_len % update_interval != 0:
-        return
-
     clustered_decode_tokens = getattr(self, "clustered_decode_tokens", 0)
-    if generated_len <= clustered_decode_tokens:
+    pending_decode_tokens = generated_len - clustered_decode_tokens
+    if generated_len <= 0 or pending_decode_tokens < update_interval:
         return
 
-    append_start = max(sink, key_states.shape[-2] - update_interval)
-    append_end = key_states.shape[-2]
+    append_end = max(sink, key_states.shape[-2] - local_window)
+    append_start = max(sink, append_end - update_interval)
     if append_end - append_start < append_nlist:
         return
 
@@ -805,7 +811,7 @@ def forward_cluster(
         key_states = repeat_kv(key_states, self.num_key_value_groups)
         value_states = repeat_kv(value_states, self.num_key_value_groups)
 
-    token_budget = min(self.prompt_len, self.token_budget)
+    token_budget = self.token_budget
     attn_weights = None
     if os.getenv("STREAMING"):
         attn_output = streaming_attn_out(query_states, key_states, value_states, attention_mask,
@@ -999,7 +1005,7 @@ def forward_cluster_glm(
     # ==================================
 
     # context_layer = self.core_attention(query_layer, key_layer, value_layer, attention_mask)
-    token_budget = min(self.prompt_len, self.token_budget)
+    token_budget = self.token_budget
     context_layer, _ = cluster_attn_out(
         query_layer, key_layer, value_layer, attention_mask, 
         self.prompt_len, self.key_centroids, self.cluster_key_indices, 
