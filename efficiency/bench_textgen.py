@@ -34,11 +34,27 @@ MODEL_CFGS = {
 }
 
 
+def ensure_tokenizer_padding(tokenizer):
+    if tokenizer.pad_token_id is None:
+        if tokenizer.eos_token_id is not None:
+            tokenizer.pad_token = tokenizer.eos_token
+        elif tokenizer.unk_token_id is not None:
+            tokenizer.pad_token = tokenizer.unk_token
+        else:
+            raise ValueError(
+                "Tokenizer has no pad/eos/unk token for batching. "
+                "Please set pad token explicitly."
+            )
+    # For decoder-only models, left padding keeps the last token position aligned.
+    tokenizer.padding_side = "left"
+
+
 def load_model(model_cfg: ModelConfig, method: str):
     device = torch.device(model_cfg.device)
     dtype = getattr(torch, model_cfg.dtype)
     torch.set_default_dtype(dtype)
     tokenizer = AutoTokenizer.from_pretrained(model_cfg.model_path, trust_remote_code=True)
+    ensure_tokenizer_padding(tokenizer)
 
     with device:
         if method == "quest":
