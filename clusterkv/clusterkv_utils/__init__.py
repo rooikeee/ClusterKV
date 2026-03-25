@@ -118,9 +118,39 @@ def prefill_forward(
     # key_states = key_states.squeeze(1).contiguous()   # [prompt_len, num_kv_heads, head_dim]
     # value_states = value_states.squeeze(1).contiguous()   # [prompt_len, num_kv_heads, head_dim]
     if key_states is not None:
-        o = flashinfer.single_prefill_with_kv_cache(q, key_states, value_states, 
-                                                    causal=True, use_fp16_qk_reduction=False,
-                                                    rope_scale=rope_scale, rope_theta=rope_theta)
+        # FlashInfer API differs across versions. Prefer the newest signature and
+        # fallback to older ones when keyword arguments are unsupported.
+        try:
+            o = flashinfer.single_prefill_with_kv_cache(
+                q,
+                key_states,
+                value_states,
+                causal=True,
+                use_fp16_qk_reduction=False,
+                rope_scale=rope_scale,
+                rope_theta=rope_theta,
+            )
+        except TypeError as e:
+            err = str(e)
+            if "use_fp16_qk_reduction" in err:
+                try:
+                    o = flashinfer.single_prefill_with_kv_cache(
+                        q,
+                        key_states,
+                        value_states,
+                        causal=True,
+                        rope_scale=rope_scale,
+                        rope_theta=rope_theta,
+                    )
+                except TypeError:
+                    o = flashinfer.single_prefill_with_kv_cache(
+                        q,
+                        key_states,
+                        value_states,
+                        causal=True,
+                    )
+            else:
+                raise
     else:
         f = _kernels.prefill_with_paged_kv_cache
         o = f(
