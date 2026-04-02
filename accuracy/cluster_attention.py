@@ -470,13 +470,28 @@ def cluster_attn_out(query_states, key_states, value_states, attention_mask, pro
             if head_sel == "pad":
                 sel_key_indices = pad_sequence(sel_key_indices, batch_first=True, padding_value=kv_seq_len)
             elif head_sel == "truc":
-                sel_key_indices = torch.stack([ind[:cluster_budget] for ind in sel_key_indices])
+                # Keep fixed shape for all heads; fill shortage with sentinel.
+                packed = []
+                for ind in sel_key_indices:
+                    if ind.numel() >= cluster_budget:
+                        packed.append(ind[:cluster_budget])
+                    else:
+                        fill_len = cluster_budget - ind.numel()
+                        fill = torch.full((fill_len,), kv_seq_len, dtype=ind.dtype, device=ind.device)
+                        packed.append(torch.cat([ind, fill], dim=0))
+                sel_key_indices = torch.stack(packed)
             else:
                 assert False
 
         sel_key_indices = sel_key_indices.unsqueeze(0)
         sel_key_indices += sink
-        sel_key_indices[sel_key_indices > kv_seq_len] = kv_seq_len
+        if head_sel == "truc":
+            # `truc` gathers from `key_states` directly, so all indices must be valid.
+            sel_key_indices = sel_key_indices.clamp(min=0, max=max(kv_seq_len - 1, 0))
+        else:
+            # `pad` gathers from `torch.cat([key_states, kpad], dim=2)`, so `kv_seq_len`
+            # is the valid sentinel that points to the extra padded slot.
+            sel_key_indices = sel_key_indices.clamp(min=0, max=kv_seq_len)
     else:
         sel_heads = num_kv_heads if gqa_policy else num_heads
         sel_key_indices = torch.empty((1, sel_heads, 0), dtype=torch.int64, device=key_states.device)
@@ -485,7 +500,8 @@ def cluster_attn_out(query_states, key_states, value_states, attention_mask, pro
     if os.getenv("GET_ATTN") and not os.getenv("NORMAL_ATTN"):
         res_attn_weight = torch.zeros((1, num_heads, 1, kv_seq_len), dtype=torch.int32, device=key_states.device)
         if sel_key_indices.shape[-1] > 0 and sel_key_indices.shape[1] == num_heads:
-            res_attn_weight = res_attn_weight.scatter_(dim=-1, index=sel_key_indices.unsqueeze(2), value=1.0)
+            vis_indices = sel_key_indices.clamp(min=0, max=max(kv_seq_len - 1, 0))
+            res_attn_weight = res_attn_weight.scatter_(dim=-1, index=vis_indices.unsqueeze(2), value=1.0)
 
     if topk_stat and c_dist is not None and sel_key_indices.shape[-1] > 0 and sel_key_indices.shape[1] == num_heads:
         sink_indices = torch.arange(sink, device=sel_key_indices.device).repeat(1, num_heads, 1)
