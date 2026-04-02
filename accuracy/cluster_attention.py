@@ -35,8 +35,41 @@ def repeat_metadata(metadata: torch.Tensor, n_rep: int) -> torch.Tensor:
     metadata = metadata[:, None, :].expand(num_key_value_heads, n_rep, slen)
     return metadata.reshape(num_key_value_heads * n_rep, slen)
 
+def _sanitize_cluster_input(x: torch.Tensor) -> torch.Tensor:
+    x = x.contiguous()
+    if torch.isfinite(x).all():
+        return x
+    # RAFT kmeans can crash on NaN/Inf inputs with device-side assert.
+    return torch.nan_to_num(x, nan=0.0, posinf=0.0, neginf=0.0).contiguous()
+
+
+def _torch_kmeans_centroids(head_keys: torch.Tensor, nlist: int, max_iter: int) -> torch.Tensor:
+    seq_len = head_keys.shape[0]
+    eff_nlist = max(1, min(nlist, seq_len))
+
+    if eff_nlist == 1:
+        centroids = head_keys[:1].clone()
+    else:
+        init_idx = torch.linspace(0, seq_len - 1, steps=eff_nlist, device=head_keys.device).round().long()
+        centroids = head_keys[init_idx].contiguous()
+
+    iter_n = max(int(max_iter), 1)
+    keys_norm = F.normalize(head_keys, p=2, dim=-1, eps=1e-12)
+    for _ in range(iter_n):
+        centroid_norm = F.normalize(centroids, p=2, dim=-1, eps=1e-12)
+        labels = torch.argmax(torch.mm(keys_norm, centroid_norm.t()), dim=-1)
+        new_centroids = torch.zeros_like(centroids)
+        new_centroids.index_add_(0, labels, head_keys)
+        counts = torch.bincount(labels, minlength=eff_nlist).unsqueeze(1)
+        valid = counts.squeeze(1) > 0
+        counts = counts.clamp(min=1)
+        new_centroids = new_centroids / counts
+        centroids = torch.where(valid.unsqueeze(1), new_centroids, centroids)
+    return centroids
+
 def build_cluster(prefill_key, prefill_value, nlist, balance, cluster_params, 
-                  num_key_value_groups, gqa_policy, mode):
+                  num_key_value_groups, gqa_policy, mode, force_torch_kmeans=False):
+    nlist = max(int(nlist), 1)
     _, num_kv_heads, prefill_len, head_dim = prefill_key.shape
     nlist_range = torch.arange(nlist, device=prefill_key.device).reshape(nlist, 1)
     cluster_key_indices = torch.empty((num_kv_heads, prefill_len), dtype=torch.int64,
@@ -54,17 +87,18 @@ def build_cluster(prefill_key, prefill_value, nlist, balance, cluster_params,
         all_head_max_indices = None
     device = prefill_key.device
     for h in range(num_kv_heads):
-        head_keys = prefill_key[0, h].to(torch.float32)
+        head_keys = _sanitize_cluster_input(prefill_key[0, h].to(torch.float32))
         seq_len = head_keys.shape[0]
+        eff_nlist = max(1, min(nlist, seq_len))
         
         if mode == "max_key_norm" or mode == "max_value_norm":
             if mode == "max_key_norm":
                 magnitudes = torch.norm(head_keys.float(), p=2, dim=-1) # [m_len]
             else:
-                head_values = prefill_value[0, h].to(torch.float32)
+                head_values = _sanitize_cluster_input(prefill_value[0, h].to(torch.float32))
                 magnitudes = torch.norm(head_values.float(), p=2, dim=-1)
-            chunk_size = (prefill_len + nlist - 1) // nlist
-            pad_len = chunk_size * nlist - prefill_len
+            chunk_size = (seq_len + eff_nlist - 1) // eff_nlist
+            pad_len = chunk_size * eff_nlist - seq_len
             
             if pad_len > 0:
                 pad_mag = torch.full((pad_len,), -1e9, device=device)
@@ -73,50 +107,81 @@ def build_cluster(prefill_key, prefill_value, nlist, balance, cluster_params,
                 padded_mag = magnitudes
                 
             # [num_buckets, chunk_size]
-            reshaped_mag = padded_mag.view(nlist, chunk_size)
+            reshaped_mag = padded_mag.view(eff_nlist, chunk_size)
             
             local_max_indices = torch.argmax(reshaped_mag, dim=-1)
             
-            chunk_offsets = torch.arange(nlist, device=device) * chunk_size
+            chunk_offsets = torch.arange(eff_nlist, device=device) * chunk_size
             leader_indices = chunk_offsets + local_max_indices
-            leader_indices = torch.clamp(leader_indices, max=prefill_len - 1)
+            leader_indices = torch.clamp(leader_indices, max=seq_len - 1)
             
             head_centroids = head_keys[leader_indices]
             
-            for _ in range(cluster_params.max_iter):
+            max_iter = getattr(cluster_params, "max_iter", getattr(cluster_params, "kmeans_n_iters", 20))
+            for _ in range(max(int(max_iter), 1)):
                 sim = torch.mm(
-                    F.normalize(head_keys, p=2, dim=-1), 
-                    F.normalize(head_centroids, p=2, dim=-1).t()
+                    F.normalize(head_keys, p=2, dim=-1, eps=1e-12), 
+                    F.normalize(head_centroids, p=2, dim=-1, eps=1e-12).t()
                 )
                 _, labels = torch.max(sim, dim=-1)
                 
                 new_centroids = torch.zeros_like(head_centroids)
                 new_centroids.index_add_(0, labels, head_keys)
                 
-                counts = torch.bincount(labels, minlength=nlist).unsqueeze(1).clamp(min=1)
+                counts = torch.bincount(labels, minlength=eff_nlist).unsqueeze(1).clamp(min=1)
                 head_centroids = new_centroids / counts
         else:
-            if balance:
-                flat_index = ivf_flat.build(cluster_params, head_keys)
+            if force_torch_kmeans:
+                max_iter = getattr(cluster_params, "max_iter", getattr(cluster_params, "kmeans_n_iters", 20))
+                head_centroids = _torch_kmeans_centroids(head_keys, eff_nlist, max_iter)
+            elif balance:
+                build_params = cluster_params
+                if getattr(cluster_params, "n_lists", eff_nlist) != eff_nlist:
+                    fit_iter = getattr(cluster_params, "kmeans_n_iters", 20)
+                    build_params = ivf_flat.IndexParams(
+                        n_lists=eff_nlist,
+                        metric='inner_product',
+                        kmeans_n_iters=fit_iter,
+                        kmeans_trainset_fraction=1,
+                        add_data_on_build=False,
+                    )
+                if head_keys.is_cuda:
+                    with torch.cuda.device(head_keys.device):
+                        flat_index = ivf_flat.build(build_params, head_keys)
+                else:
+                    flat_index = ivf_flat.build(build_params, head_keys)
                 head_centroids = flat_index.centers
             else:
-                head_centroids, _, _ = fit(cluster_params, head_keys)
+                fit_params = cluster_params
+                if getattr(cluster_params, "n_clusters", eff_nlist) != eff_nlist:
+                    max_iter = getattr(cluster_params, "max_iter", 20)
+                    metric = getattr(cluster_params, "metric", "cosine")
+                    fit_params = KMeansParams(n_clusters=eff_nlist, max_iter=max_iter, metric=metric)
+                if head_keys.is_cuda:
+                    with torch.cuda.device(head_keys.device):
+                        head_centroids, _, _ = fit(fit_params, head_keys)
+                else:
+                    head_centroids, _, _ = fit(fit_params, head_keys)
+        if eff_nlist < nlist:
+            # Keep metadata shape stable across heads even when seq_len < requested nlist.
+            pad_centroids = head_centroids[-1:, :].expand(nlist - eff_nlist, -1)
+            head_centroids = torch.cat([head_centroids, pad_centroids], dim=0)
         head_centroids = head_centroids.to(prefill_key.dtype)
         # centoid_indices: (prefill_len,)
-        _, centoid_indices = torch.max(torch.mm(F.normalize(prefill_key[0, h], p=2, dim=-1), 
-                                                F.normalize(head_centroids, p=2, dim=-1).t().to(prefill_key.device)), 
+        _, centoid_indices = torch.max(torch.mm(F.normalize(head_keys, p=2, dim=-1, eps=1e-12), 
+                                                F.normalize(head_centroids.to(torch.float32), p=2, dim=-1, eps=1e-12).t().to(prefill_key.device)), 
                                                 dim=-1)
         
         if pre_rope:
             token_positions = torch.arange(seq_len, device=head_keys.device)
-            max_pos_indices = torch.empty(nlist, dtype=torch.long, device=head_keys.device)
+            max_pos_indices = torch.full((nlist,), -1, dtype=torch.long, device=head_keys.device)
             
             max_pos_indices.scatter_reduce_(
                 0, 
                 centoid_indices, 
                 token_positions, 
                 reduce='max', 
-                include_self=False
+                include_self=True
             )
             all_head_max_indices[h] = max_pos_indices
         # if centoid_indices is like [3, 1, 1, 2]
@@ -617,6 +682,7 @@ def maybe_append_decode_clusters(self, key_states, value_states, sink):
             self.num_key_value_groups,
             self.gqa_policy,
             self.mode,
+            force_torch_kmeans=True,
         )
         if append_all_head_max_indices is not None:
             self.all_head_max_indices = append_all_head_max_indices
