@@ -539,12 +539,18 @@ class LlamaForCausalLM(LlamaPreTrainedModel):
         offload = False,
         offload_all_layers = False,
         batch_size: int = 1,
+        cpu_kv_all: bool = False,
     ):
         """
         Init function for ClusterKV. Must be called before forwarding.
-        This function allocates all GPU memory for max_seq_len KV-Cache.
+        This function allocates KV buffers and metadata.
+        Set `cpu_kv_all=True` to keep all-layer KV cache on CPU and only
+        stage needed tokens back to GPU during decode.
         """
         assert self.model.controller is None and self.model.controllers is None, "Can't init ClusterKV Controller twice."
+        if cpu_kv_all:
+            offload = True
+            offload_all_layers = True
         
         config = self._config
         self.model._nlist = nlist
@@ -582,6 +588,8 @@ class LlamaForCausalLM(LlamaPreTrainedModel):
         print(f"ClusterKV allocates KV-Cache of {max_seq_len} tokens")
         print(f"Token budget is set to {token_budget}")
         print(f"Batch size is set to {batch_size}")
+        print(f"CPU KV offload: {'enabled' if offload else 'disabled'}")
+        print(f"CPU KV all layers: {'enabled' if offload_all_layers else 'disabled'}")
     
     def clusterkv_clear(self):
         """

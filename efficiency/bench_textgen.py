@@ -210,6 +210,10 @@ def build_batch_prompts(prompts: List[str], batch_size: int, batch_mode: str) ->
     return prompts[:batch_size]
 
 
+def _sec_to_ms(sec: float) -> float:
+    return sec * 1000.0
+
+
 @torch.inference_mode()
 def benchmark_clusterkv():
     parser = argparse.ArgumentParser()
@@ -322,6 +326,7 @@ def benchmark_clusterkv():
 
     prefill_latency = []
     decode_latency = []
+    decode_total_latency_per_iter = []
     decode_steps_per_iter = []
 
     for _ in tqdm(range(args.iteration)):
@@ -348,15 +353,19 @@ def benchmark_clusterkv():
 
         # Decode stage.
         step_count = 0
+        decode_total_this_iter = 0.0
         for _ in range(args.decode_len):
             ts = time.perf_counter()
             output = model(input_ids=pred_token_idx)
             te = time.perf_counter()
-            decode_latency.append(te - ts)
+            step_latency = te - ts
+            decode_latency.append(step_latency)
+            decode_total_this_iter += step_latency
             step_count += 1
             pred_token_idx = output.logits[:, -1, :].argmax(dim=-1).unsqueeze(-1)
             for b_idx in range(args.batch_size):
                 generated_ids[b_idx].append(pred_token_idx[b_idx].item())
+        decode_total_latency_per_iter.append(decode_total_this_iter)
         decode_steps_per_iter.append(step_count)
 
         # print first sample decode as sanity-check
@@ -369,24 +378,31 @@ def benchmark_clusterkv():
             model.clusterkv_clear()
 
     warmup = args.warmup
-    avg_prefill_latency = np.mean(prefill_latency[warmup:])
-    decode_latency_post_warmup = decode_latency[warmup * args.decode_len :]
-    avg_decode_latency = np.mean(decode_latency_post_warmup) if decode_latency_post_warmup else 0.0
-    avg_decode_steps = np.mean(decode_steps_per_iter[warmup:]) if decode_steps_per_iter[warmup:] else 0.0
-    # If generated decode length is shorter than target decode_len,
-    # normalize decode time with single-token latency * target decode_len.
-    norm_decode_total_latency = avg_decode_latency * args.decode_len
-    raw_decode_total_latency = avg_decode_latency * avg_decode_steps
-    norm_total_latency = avg_prefill_latency + norm_decode_total_latency
-    raw_total_latency = avg_prefill_latency + raw_decode_total_latency
+    prefill_post = prefill_latency[warmup:]
+    decode_total_post = decode_total_latency_per_iter[warmup:]
+    decode_steps_post = decode_steps_per_iter[warmup:]
 
-    print("batch_size,token_budget,context_len,target_decode_len,avg_prefill_latency,avg_decode_latency_per_token,raw_decode_total_latency,norm_decode_total_latency,raw_total_latency,norm_total_latency")
+    avg_prefill_latency = float(np.mean(prefill_post)) if prefill_post else 0.0
+    avg_decode_total_latency = float(np.mean(decode_total_post)) if decode_total_post else 0.0
+    total_decode_time = float(np.sum(decode_total_post)) if decode_total_post else 0.0
+    total_decode_steps = int(np.sum(decode_steps_post)) if decode_steps_post else 0
+    avg_decode_latency = (total_decode_time / total_decode_steps) if total_decode_steps > 0 else 0.0
+
+    report_decode_tokens = 512
+    decode_512_latency = avg_decode_latency * report_decode_tokens
+    total_512_latency = avg_prefill_latency + decode_512_latency
+
+    print("=" * 100)
+    print("Timing Summary (post-warmup)")
     print(
-        f"{args.batch_size},{token_budget},{args.context_len},{args.decode_len},"
-        f"{avg_prefill_latency},{avg_decode_latency},"
-        f"{raw_decode_total_latency},{norm_decode_total_latency},"
-        f"{raw_total_latency},{norm_total_latency}"
+        f"Config: batch={args.batch_size}, token_budget={token_budget}, "
+        f"context_len={args.context_len}, decode_len={args.decode_len}, warmup={warmup}"
     )
+    print(f"Prefill Time: {_sec_to_ms(avg_prefill_latency):.3f} ms")
+    print(f"Decode Time (avg/token): {_sec_to_ms(avg_decode_latency):.3f} ms")
+    print(f"Decode Time ({report_decode_tokens} tokens): {_sec_to_ms(decode_512_latency):.3f} ms")
+    print(f"Total Time = Prefill + Decode{report_decode_tokens}: {_sec_to_ms(total_512_latency):.3f} ms")
+    print("=" * 100)
 
 
 def seed_everything(seed: int):

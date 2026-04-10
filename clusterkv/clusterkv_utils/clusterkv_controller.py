@@ -40,19 +40,20 @@ class ClusterKVController:
 		self.max_seq_len = max_seq_len
 		self.kv_cache: List[torch.Tensor] = [None] * num_layers
 		self.offload_all_layers = bool(offload_all_layers)
+		# When all-layer CPU KV is requested, force-enable offload mode.
+		self.offload = bool(offload or self.offload_all_layers)
 		for i in range(num_layers):
-			layer_offload = offload and (self.offload_all_layers or i >= 2)
+			layer_offload = self.offload and (self.offload_all_layers or i >= 2)
 			layer_num_kv_heads = num_heads if layer_offload else num_kv_heads
 			layer_kv_cache_size = (sink + token_budget + window) if layer_offload else max_seq_len
 			self.kv_cache[i] = torch.empty(
 				(layer_kv_cache_size, 2, 1, layer_num_kv_heads, head_dim),
 				dtype=dtype, device=device
 			)
-		self.num_kv_heads_ = num_heads if offload else num_kv_heads
+		self.num_kv_heads_ = num_heads if self.offload else num_kv_heads
 		
 		# ==================================== Offload related ====================================
 		self.default_stream = torch.cuda.default_stream()
-		self.offload = offload
 		self.offload_stream = None
 		self.offload_events = None
 		self.kv_cache_cpu: List[torch.Tensor] = [None] * num_layers
@@ -64,8 +65,8 @@ class ClusterKVController:
 		self.swap_in_indices: Optional[torch.Tensor] = None
 		self.swap_out_count: Optional[torch.Tensor] = None
 		self.swap_in_count: Optional[torch.Tensor] = None
-		assert not (offload and full), "offload cannot be enabled for full kv"
-		if offload:
+		assert not (self.offload and full), "offload cannot be enabled for full kv"
+		if self.offload:
 			for i in range(num_layers):
 				layer_offload = self.should_offload_layer(i)
 				if not layer_offload:

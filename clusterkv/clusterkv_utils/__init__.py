@@ -263,13 +263,15 @@ def decode_sparse_attn(
         # recall_impl = "naive"
         recall_impl = ""
         if topk_indices is not None:
+            # Ensure the latest GPU->CPU offload is visible before CPU->GPU recall.
+            if controller.offload_events is not None and controller.offload_events[layer_idx] is not None:
+                controller.default_stream.wait_event(controller.offload_events[layer_idx])
             if recall_impl == "naive":
                 num_heads, budget = topk_indices.shape 
                 # [K, 1, num_heads, 1]
                 topk_indices = topk_indices.transpose(0, 1).unsqueeze(1).unsqueeze(3)
                 # [K, 2, num_heads, head_dim]
                 topk_indices = topk_indices.expand(budget, 2, num_heads, controller.head_dim)
-                controller.default_stream.wait_event(controller.offload_events[layer_idx])
                 cpu_select_kv = torch.gather(
                     controller.kv_cache_cpu[layer_idx].repeat_interleave(controller.num_key_value_groups, dim=-2), 
                     0, topk_indices.to("cpu").to(torch.int64))
