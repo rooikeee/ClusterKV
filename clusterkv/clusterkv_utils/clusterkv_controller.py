@@ -342,6 +342,40 @@ class ClusterKVController:
 			self.kv_cache_cpu[layer_idx][:seq_len, 1, ...].copy_(v, non_blocking=True)
 			self.offload_events[layer_idx].record(self.offload_stream)
 
+	def offload_decode_kv(self, layer_idx, k, v):
+		if not self.should_offload_layer(layer_idx):
+			return
+		if self.offload_stream is None or self.kv_cache_cpu[layer_idx] is None:
+			return
+		seq_len = k.shape[0]
+		start = self.kv_seqlen - seq_len
+		end = start + seq_len
+		if start < 0:
+			start = 0
+		end = min(end, self.max_seq_len)
+		if end <= start:
+			return
+		with torch.cuda.stream(self.offload_stream):
+			self.kv_cache_cpu[layer_idx][start:end, 0, ...].copy_(k[: end - start], non_blocking=True)
+			self.kv_cache_cpu[layer_idx][start:end, 1, ...].copy_(v[: end - start], non_blocking=True)
+			self.offload_events[layer_idx].record(self.offload_stream)
+
+	def stage_prefix_from_cpu(self, layer_idx, prefix_len: int):
+		if not self.should_offload_layer(layer_idx):
+			return
+		if self.kv_cache_cpu[layer_idx] is None:
+			return
+		prefix_len = int(prefix_len)
+		prefix_len = min(prefix_len, self.kv_seqlen, self.max_seq_len, self.kv_cache[layer_idx].shape[0])
+		if prefix_len <= 0:
+			return
+		if self.offload_events is not None and self.offload_events[layer_idx] is not None:
+			self.default_stream.wait_event(self.offload_events[layer_idx])
+		cpu_prefix = self.kv_cache_cpu[layer_idx][:prefix_len]
+		# CPU stores KV heads, while offload GPU cache stores expanded heads for decode kernel.
+		gpu_prefix = cpu_prefix.repeat_interleave(self.num_key_value_groups, dim=2).unsqueeze(2)
+		self.kv_cache[layer_idx][:prefix_len].copy_(gpu_prefix, non_blocking=True)
+
 	def offload_window_kv(self, layer_idx):
 		window = self.window
 		kv = self.kv_cache[layer_idx][-window:, :, 0, self.kv_head_slice, :]

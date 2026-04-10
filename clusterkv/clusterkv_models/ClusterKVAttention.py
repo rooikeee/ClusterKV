@@ -96,6 +96,9 @@ class ClusterKVAttention(nn.Module):
             self.layer_idx,
         )
         torch.cuda.nvtx.range_pop()
+        if q_len == 1 and controller.should_offload_layer(self.layer_idx):
+            # Keep CPU as source-of-truth cache during decode.
+            controller.offload_decode_kv(self.layer_idx, key_states, value_states)
 
         if self.layer_idx >= 2 and not controller.full:
             if controller.window > 0 and q_len == 1 and controller.generated_len % controller.window == 0:

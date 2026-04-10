@@ -262,7 +262,16 @@ def decode_sparse_attn(
     if controller.should_offload_layer(layer_idx):
         # recall_impl = "naive"
         recall_impl = ""
-        if topk_indices is not None:
+        if topk_indices is None:
+            # Strict offload path: stage the currently needed prefix from CPU.
+            # Approx decode length is [sink + budget + optional window].
+            if controller.kv_indptr_for_append_offload is not None:
+                offload_seqlen = int(controller.kv_indptr_for_append_offload[-1].item())
+            else:
+                offload_budget = controller.get_effective_offload_budget()
+                offload_seqlen = min(controller.kv_seqlen, controller.sink + offload_budget + controller.cur_win_size)
+            controller.stage_prefix_from_cpu(layer_idx, offload_seqlen)
+        else:
             # Ensure the latest GPU->CPU offload is visible before CPU->GPU recall.
             if controller.offload_events is not None and controller.offload_events[layer_idx] is not None:
                 controller.default_stream.wait_event(controller.offload_events[layer_idx])
