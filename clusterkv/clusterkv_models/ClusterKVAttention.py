@@ -36,6 +36,8 @@ class ClusterKVAttention(nn.Module):
         self.k_proj = nn.Linear(self.hidden_size, self.num_key_value_heads * self.head_dim, bias=False)
         self.v_proj = nn.Linear(self.hidden_size, self.num_key_value_heads * self.head_dim, bias=False)
         self.o_proj = nn.Linear(self.num_heads * self.head_dim, self.hidden_size, bias=False)
+        self.decode_cluster_interval = 320
+        self.decode_append_nlist = 4
         self._init_rope()
 
     def _init_rope(self):
@@ -54,6 +56,199 @@ class ClusterKVAttention(nn.Module):
     def _shape(self, tensor: torch.Tensor, seq_len: int, bsz: int):
         return tensor.view(bsz, seq_len, self.num_heads, self.head_dim).transpose(1, 2).contiguous()
 
+    def _use_strict_cpu_cluster_mode(self, controller: ClusterKVController) -> bool:
+        return bool(
+            getattr(controller, "offload", False)
+            and getattr(controller, "offload_all_layers", False)
+            and not getattr(controller, "full", False)
+        )
+
+    def _wait_offload_to_cpu(self, controller: ClusterKVController, device: torch.device):
+        if controller.offload_events is None:
+            return
+        event = controller.offload_events[self.layer_idx]
+        if event is None:
+            return
+        stream = torch.cuda.current_stream(device=device)
+        stream.wait_event(event)
+        stream.synchronize()
+
+    def _maybe_build_prefill_clusters(
+        self,
+        key_states: torch.Tensor,
+        controller: ClusterKVController,
+    ):
+        if self.layer_idx < 2 or controller.full:
+            return
+        if key_states.shape[0] <= controller.sink:
+            return
+        build_cluster(
+            controller,
+            self.layer_idx,
+            key_states[controller.sink:],
+            0,
+            max(int(controller.nlist), 1),
+            torch.cuda.default_stream(),
+        )
+
+    def _maybe_build_decode_clusters(
+        self,
+        controller: ClusterKVController,
+        query_device: torch.device,
+    ):
+        if self.layer_idx < 2 or controller.full:
+            return
+        generated_len = controller.generated_len
+        if generated_len <= 0 or generated_len % self.decode_cluster_interval != 0:
+            return
+        if controller.kv_cache_cpu[self.layer_idx] is None:
+            return
+
+        chunk_end = min(controller.kv_seqlen, controller.max_seq_len)
+        chunk_start = max(controller.prompt_len, chunk_end - self.decode_cluster_interval)
+        if chunk_end - chunk_start < self.decode_append_nlist:
+            return
+
+        self._wait_offload_to_cpu(controller, query_device)
+        chunk_keys_cpu = controller.kv_cache_cpu[self.layer_idx][chunk_start:chunk_end, 0, ...]
+        chunk_keys = chunk_keys_cpu.to(query_device, non_blocking=True)
+        key_offset = max(chunk_start - controller.sink, 0)
+        build_cluster(
+            controller,
+            self.layer_idx,
+            chunk_keys,
+            key_offset,
+            self.decode_append_nlist,
+            torch.cuda.default_stream(),
+        )
+
+    def _build_head_token_indices(
+        self,
+        controller: ClusterKVController,
+        kv_len: int,
+        head_idx: int,
+        cluster_indices: Optional[torch.Tensor],
+        device: torch.device,
+    ) -> torch.Tensor:
+        pieces = []
+        sink_len = min(max(int(controller.sink), 0), kv_len)
+        if sink_len > 0:
+            pieces.append(torch.arange(sink_len, dtype=torch.long, device=device))
+
+        if cluster_indices is not None and cluster_indices.numel() > 0:
+            pieces.append(cluster_indices[head_idx].to(device=device, dtype=torch.long))
+
+        if controller.cur_win_size > 0:
+            pieces.append(controller.cur_win_indices[head_idx].to(device=device, dtype=torch.long))
+
+        if pieces:
+            indices = torch.cat(pieces, dim=0)
+        else:
+            indices = torch.arange(kv_len, dtype=torch.long, device=device)
+
+        if kv_len > 0:
+            indices = indices.clamp(min=0, max=kv_len - 1)
+        return indices
+
+    def _decode_attention_from_cpu(
+        self,
+        query_states: torch.Tensor,  # [1, num_heads, head_dim]
+        controller: ClusterKVController,
+        cluster_indices: Optional[torch.Tensor],
+    ) -> torch.Tensor:
+        if controller.kv_cache_cpu[self.layer_idx] is None:
+            raise RuntimeError(
+                "Strict CPU ClusterKV mode requires per-layer CPU KV cache, but cache is missing."
+            )
+
+        device = query_states.device
+        self._wait_offload_to_cpu(controller, device)
+
+        kv_len = min(controller.kv_seqlen, controller.max_seq_len)
+        if kv_len <= 0:
+            return torch.zeros((1, self.num_heads, self.head_dim), dtype=query_states.dtype, device=device)
+
+        kv_cpu = controller.kv_cache_cpu[self.layer_idx][:kv_len]
+        cpu_k = kv_cpu[:, 0, ...]  # [kv_len, num_kv_heads, head_dim]
+        cpu_v = kv_cpu[:, 1, ...]
+        q = query_states[0]        # [num_heads, head_dim]
+        scale = 1.0 / math.sqrt(self.head_dim)
+        outputs = []
+
+        for h in range(self.num_heads):
+            head_indices = self._build_head_token_indices(
+                controller=controller,
+                kv_len=kv_len,
+                head_idx=h,
+                cluster_indices=cluster_indices,
+                device=device,
+            )
+            head_indices_cpu = head_indices.to(device="cpu", dtype=torch.long)
+            kv_h = h // self.num_key_value_groups
+
+            head_k = cpu_k.index_select(0, head_indices_cpu)[:, kv_h, :].to(device, non_blocking=True)
+            head_v = cpu_v.index_select(0, head_indices_cpu)[:, kv_h, :].to(device, non_blocking=True)
+            logits = torch.matmul(head_k, q[h]) * scale
+            probs = torch.softmax(logits.to(torch.float32), dim=0).to(q.dtype)
+            head_out = torch.matmul(probs.unsqueeze(0), head_v).squeeze(0)
+            outputs.append(head_out)
+
+        return torch.stack(outputs, dim=0).unsqueeze(0)
+
+    def _forward_single_strict_cpu(
+        self,
+        query_states: torch.Tensor,
+        key_states: torch.Tensor,
+        value_states: torch.Tensor,
+        q_len: int,
+        controller: ClusterKVController,
+        shared_sel_token_indices: Optional[torch.Tensor] = None,
+    ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+        if q_len > 1:
+            self._maybe_build_prefill_clusters(key_states, controller)
+            torch.cuda.nvtx.range_push("prefill_attn")
+            attn_output = prefill_forward(
+                query_states,
+                controller,
+                self.layer_idx,
+                key_states=key_states,
+                value_states=value_states,
+            )
+            torch.cuda.nvtx.range_pop()
+            controller.offload_prefill_kv(self.layer_idx, key_states, value_states)
+            return attn_output, None
+
+        # Decode: CPU is the source of truth for KV cache.
+        controller.offload_decode_kv(self.layer_idx, key_states, value_states)
+        self._maybe_build_decode_clusters(controller, query_states.device)
+
+        selected_cluster_indices = None
+        if self.layer_idx >= 2 and not controller.full:
+            has_cluster_metadata = (
+                controller.centroids[self.layer_idx] is not None
+                and controller.cluster_size[self.layer_idx] is not None
+                and controller.cluster_size_ps[self.layer_idx] is not None
+                and controller.cluster_key_indices[self.layer_idx] is not None
+            )
+            if has_cluster_metadata:
+                if shared_sel_token_indices is None:
+                    update_sel_indices(
+                        query_states,
+                        controller,
+                        self.layer_idx,
+                    )
+                    shared_sel_token_indices = controller.sel_token_indices
+                selected_cluster_indices = shared_sel_token_indices
+
+        torch.cuda.nvtx.range_push("cpu_decode_attn")
+        attn_output = self._decode_attention_from_cpu(
+            query_states,
+            controller,
+            selected_cluster_indices,
+        )
+        torch.cuda.nvtx.range_pop()
+        return attn_output, shared_sel_token_indices
+
     def _forward_single(
         self,
         query_states: torch.Tensor,
@@ -63,6 +258,16 @@ class ClusterKVAttention(nn.Module):
         controller: ClusterKVController,
         shared_sel_token_indices: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+        if self._use_strict_cpu_cluster_mode(controller):
+            return self._forward_single_strict_cpu(
+                query_states=query_states,
+                key_states=key_states,
+                value_states=value_states,
+                q_len=q_len,
+                controller=controller,
+                shared_sel_token_indices=shared_sel_token_indices,
+            )
+
         if self.layer_idx >= 2 and not controller.full:
             if q_len > 1:
                 # build clusters during prefill
