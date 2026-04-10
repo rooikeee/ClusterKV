@@ -7,7 +7,6 @@ import torch.utils.checkpoint
 from torch import nn
 
 from transformers.models.llama.configuration_llama import LlamaConfig
-from transformers.models.llama.modeling_llama import LlamaRotaryEmbedding
 
 from clusterkv.clusterkv_utils import ClusterKVController, build_cluster, append_kv, prefill_forward, decode_sparse_attn, update_sel_indices
 import clusterkv.utils
@@ -41,17 +40,19 @@ class ClusterKVAttention(nn.Module):
         self._init_rope()
 
     def _init_rope(self):
-        # rope_theta is default to 1e4, as set in RoPE kernel API.
-        if self.config.rope_scaling is None:
-            self.rotary_emb = LlamaRotaryEmbedding(self.head_dim, max_position_embeddings=self.max_position_embeddings)
+        # We use custom in-place RoPE kernel (`apply_rope_in_place`) during forward.
+        # Keep only the scale parsing for compatibility across LLaMA/Qwen and
+        # different Transformers versions.
+        self.rotary_emb = None
+        rope_scaling = getattr(self.config, "rope_scaling", None)
+        if rope_scaling is None:
             self.rope_scale = 1.0
+            return
+        if isinstance(rope_scaling, dict):
+            # Compatible with both {"type": ...} and {"rope_type": ...} formats.
+            self.rope_scale = float(rope_scaling.get("factor", 1.0))
         else:
-            rope_scaling = self.config.rope_scaling
-            if isinstance(rope_scaling, dict):
-                # Compatible with both {"type": ...} and {"rope_type": ...} formats.
-                self.rope_scale = float(rope_scaling.get("factor", 1.0))
-            else:
-                self.rope_scale = float(rope_scaling)
+            self.rope_scale = float(rope_scaling)
 
     def _shape(self, tensor: torch.Tensor, seq_len: int, bsz: int):
         return tensor.view(bsz, seq_len, self.num_heads, self.head_dim).transpose(1, 2).contiguous()
